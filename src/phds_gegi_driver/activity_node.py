@@ -1002,6 +1002,13 @@ def main():
     app.add_float_option("Activity", "crystal-radius-m",
                           "Detector crystal radius override (0 = use isotopes.yaml value)", 0.0)
     app.add_int_option("Activity", "n-shielding-plates", "Number of in-line shielding plates", 0)
+    app.add_bool_option("Activity", "position-correction",
+                        "Use the Compton imager's hotspot position for an off-axis "
+                        "efficiency/shielding correction (default OFF until validated in the field)")
+    app.add_float_option("Activity", "position-max-age-s",
+                          "Discard imaging hotspots older than this and fall back to on-axis", 120.0)
+    app.add_float_option("Activity", "position-geometry-exponent",
+                          "Exponent n in the off-axis geometry factor (d0/d')^n", 2.0)
     app.add_string_option("Activity", "node-name",
                            "Used to build gegi.<node-name>.command(_result) topic names", "activity")
 

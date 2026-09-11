@@ -51,3 +51,16 @@ target_link_libraries(${PROJECT_NAME}_node ${PROJECT_NAME} prism_messaging)
 
 ## Unit tests (pure logic - no detector, no messaging server required).
 ## Run with:  bash test/run_tests.sh   (plain pytest, no catkin)
+
+## Live-NATS Prism typed-messaging coverage test (EXCLUDE_FROM_ALL: build and
+## run explicitly, since it requires a reachable nats-server). Proves that
+## this driver's own JSON schemas are byte-compatible with the first-class
+## psm::types registered in deps/prism (see docs/PRISM_MIGRATION.md).
+##   cmake --build build --target test_prism_types_coverage
+##   nats-server &
+##   ./build/bin/test_prism_types_coverage
+enable_testing()
+add_executable(test_prism_types_coverage EXCLUDE_FROM_ALL test/test_prism_types_coverage.cpp)
+target_link_libraries(test_prism_types_coverage prism_messaging)
+add_test(NAME prism_types_coverage COMMAND test_prism_types_coverage)
+set_tests_properties(prism_types_coverage PROPERTIES SKIP_RETURN_CODE 77)

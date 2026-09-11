@@ -6,14 +6,36 @@ Mirrors include/phds_gegi_driver/messages.hpp and command_channel.hpp
 field-for-field. Every processing node hand-rolls JSON via these builders
 instead of using prism.JsonSender/JsonReceiver, because the custom message
 types used here (ComptonEvent, Spectrum, RunInfo, DetectorInfo,
-CommandResult) are not part of Prism's built-in typed-JSON map (only
+CommandResult) were not part of Prism's built-in typed-JSON map (only
 scalar wrapper types like DoubleValue/IntValue and a handful of geometry
-types are). This matches the pattern the C++ driver also uses for the same
+types were). This matches the pattern the C++ driver also uses for the same
 custom types, and keeps the wire format identical on both sides.
 
+UPDATE: these message types (ComptonEvent, Spectrum, RunInfo, DetectorInfo,
+Command, CommandResult, SourceDirection(s), CloudField/CloudMeta) have now
+been added as first-class typed Prism contracts -- see
+include/prism/types/gegi.hpp and src/core/type_registrations.cpp on the
+`feature/gegi-driver-types` branch of the Prism submodule
+(https://github.com/createc-uk/Prism/tree/feature/gegi-driver-types),
+pending upstream merge into `develop`. Those C++ types are registered in
+Prism's generic TypeRegistry, so any prism_app/prism_cli consumer (or any
+other C++ program linking Prism) can send/receive/decode this driver's
+messages generically, without depending on this repo's headers at all.
+The hand-rolled builders in this file remain the Python-side contract for
+now because this driver does not currently build Prism's Python bindings
+(PSM_BUILD_PYTHON_BINDINGS=OFF) -- once that branch merges and a Python
+wheel with these types is built, this file can be replaced by native
+prism.types.* objects. Wire-format compatibility between this file, the
+C++ structs below, and the new psm::types::* definitions is verified by
+test/test_prism_types_coverage.cpp (a live-NATS integration test that
+encodes with the driver's own builders and decodes with the generic
+psm::types::*::from_json handlers).
+
 IMPORTANT: keep field names here in lockstep with
-include/phds_gegi_driver/messages.hpp and command_channel.hpp. Nothing
-enforces this at compile time -- this file *is* the Python-side contract.
+include/phds_gegi_driver/messages.hpp, command_channel.hpp, and (until the
+above Prism branch merges) include/prism/types/gegi.hpp in the submodule.
+Nothing enforces this at compile time -- this file *is* the Python-side
+contract, cross-checked only by the integration test noted above.
 """
 
 import time

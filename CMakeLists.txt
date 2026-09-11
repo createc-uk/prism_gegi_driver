@@ -58,7 +58,7 @@ target_link_libraries(${PROJECT_NAME}_node ${PROJECT_NAME} prism_messaging)
 ## psm::types registered in deps/prism (see docs/PRISM_MIGRATION.md).
 ##   cmake --build build --target test_prism_types_coverage
 ##   nats-server &
-##   ./build/bin/test_prism_types_coverage
+##   ./build/test_prism_types_coverage
 enable_testing()
 add_executable(test_prism_types_coverage EXCLUDE_FROM_ALL test/test_prism_types_coverage.cpp)
 target_link_libraries(test_prism_types_coverage prism_messaging)

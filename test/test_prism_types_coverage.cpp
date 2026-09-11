@@ -310,6 +310,69 @@ int main() {
             expect(generic.nPoints == 1000 && generic.fields.size() == 4,
                    "CloudMeta: generic psm::types decode preserved n_points/fields");
         }
+
+        // ActivityResult: activity_node.py's per-window report is the one GeGi
+        // message that predates a dataType discriminator entirely -- built here
+        // WITHOUT one, exactly as the driver sends it today, to prove the
+        // generic decode does not depend on that field being present. One
+        // isotope carries the optional position-correction fields
+        // (hotspot_offset_m/slant_distance_m), the other omits them, matching
+        // activity_node.py only including those two keys when a fresh imaged
+        // hotspot was used for that line.
+        nlohmann::json activityResultJson = {
+            {"timestamp", 12345.0}, {"real_time_s", 300.0}, {"live_time_s", 294.0},
+            {"dead_time_fraction", 0.02}, {"dead_time_status", "valid"},
+            {"dt_correction_factor", 1.020408}, {"source_distance_m", 0.58},
+            {"solid_angle_fraction", 0.001498}, {"total_activity_MBq", 1.42},
+            {"isotopes", nlohmann::json::array({
+                {
+                    {"isotope", "Cs-137"}, {"energy_keV", 661.7},
+                    {"intrinsic_efficiency", 0.02}, {"solid_angle_fraction", 0.001498},
+                    {"absolute_efficiency", 3.0e-5}, {"efficiency_product", 2.9e-5},
+                    {"source_distance_m", 0.58}, {"n_shielding_plates", 0},
+                    {"total_shield_plates", 0}, {"shield_transmission", 1.0},
+                    {"position_corrected", true}, {"position_factor", 0.94},
+                    {"method", "intrinsic_efficiency"}, {"gross_counts", 5200.0},
+                    {"background_counts", 400.0}, {"net_peak_area", 4800.0},
+                    {"net_corrected", 4898.0}, {"sigma_counts", 74.6},
+                    {"activity_MBq", 1.02}, {"sigma_activity_MBq", 0.03},
+                    {"count_rate_cps", 16.66}, {"valid", true},
+                    {"below_min_counts", false},
+                    {"hotspot_offset_m", 0.18}, {"slant_distance_m", 0.605},
+                },
+                {
+                    {"isotope", "Co-60_1173"}, {"energy_keV", 1173.2},
+                    {"intrinsic_efficiency", 0.015}, {"solid_angle_fraction", 0.001498},
+                    {"absolute_efficiency", 2.2e-5}, {"efficiency_product", 2.2e-5},
+                    {"source_distance_m", 0.58}, {"n_shielding_plates", 0},
+                    {"total_shield_plates", 0}, {"shield_transmission", 1.0},
+                    {"position_corrected", false}, {"position_factor", 1.0},
+                    {"method", "intrinsic_efficiency"}, {"gross_counts", 1800.0},
+                    {"background_counts", 300.0}, {"net_peak_area", 1500.0},
+                    {"net_corrected", 1530.6}, {"sigma_counts", 45.8},
+                    {"activity_MBq", 0.40}, {"sigma_activity_MBq", 0.012},
+                    {"count_rate_cps", 5.20}, {"valid", true},
+                    {"below_min_counts", false},
+                },
+            })},
+        };
+        const std::string activityResultReceived = roundTrip(
+            *factory, connection, "test.gegi.activity_results", activityResultJson.dump());
+        expect(!activityResultReceived.empty(),
+               "ActivityResult: dataType-less Python-shaped message was received over real NATS");
+        if (!activityResultReceived.empty()) {
+            psm::types::ActivityResult generic;
+            psm::types::from_json(nlohmann::json::parse(activityResultReceived), generic);
+            expect(generic.isotopes.size() == 2 && generic.totalActivityMBq == 1.42,
+                   "ActivityResult: generic psm::types decode preserved isotopes/total_activity_MBq "
+                   "with no dataType field present");
+            expect(generic.isotopes[0].positionCorrected && generic.isotopes[0].hotspotOffsetM == 0.18,
+                   "ActivityResult: generic psm::types decode preserved the position-corrected line's "
+                   "optional hotspot_offset_m/slant_distance_m");
+            expect(!generic.isotopes[1].positionCorrected && generic.isotopes[1].hotspotOffsetM == 0.0,
+                   "ActivityResult: generic psm::types decode left hotspot_offset_m/slant_distance_m "
+                   "at their default when the source dict omitted those keys");
+        }
     }
 
     // Deliberately skip connection->close() and use _Exit() below: this test

@@ -329,6 +329,53 @@ Each point is exactly **28 bytes**, with no padding: seven contiguous 4-byte fie
 
 The producer currently uses Python `struct.pack_into('f', ...)` and native `I`/`f` reinterpretation, while all included consumers decode with `<f`/`<I`. On the supported amd64 Docker/host deployment this is little-endian and yields the layout above. A big-endian producer would need explicit little-endian format strings to preserve this contract. RGB is visualization-only. When a positive activity result is available, each isotope score is scaled to dose rate in µSv/h; otherwise the implementation uses a gamma-constant-weighted relative fallback, so consumers must not assume absolute dose units in that fallback state. Values below 10% of the current combined peak are zeroed in all three published score fields.
 
+### `activity_results`
+
+Published on `gegi.activity.results`. This raw JSON object has no `dataType` -- the one GeGi message that predates that convention. `isotopes[].hotspot_offset_m`/`slant_distance_m` are present only when a fresh imaged hotspot was used for that line's position correction (`position_corrected: true`); otherwise those two keys are simply absent, not zeroed. A first-class typed contract (`psm::types::ActivityResult`/`ActivityIsotopeResult`, adding a `dataType` for registry consistency only) now exists in `include/prism/types/gegi.hpp` alongside the other nine GeGi types -- see the note at the top of this section.
+
+```json
+{
+  "timestamp": 1784721600.0,
+  "real_time_s": 300.0,
+  "live_time_s": 294.0,
+  "dead_time_fraction": 0.02,
+  "dead_time_status": "valid",
+  "dt_correction_factor": 1.020408,
+  "source_distance_m": 0.58,
+  "solid_angle_fraction": 0.001498,
+  "total_activity_MBq": 1.42,
+  "isotopes": [
+    {
+      "isotope": "Cs-137",
+      "energy_keV": 661.7,
+      "intrinsic_efficiency": 0.02,
+      "solid_angle_fraction": 0.001498,
+      "absolute_efficiency": 3.0e-5,
+      "efficiency_product": 2.9e-5,
+      "source_distance_m": 0.58,
+      "n_shielding_plates": 0,
+      "total_shield_plates": 0,
+      "shield_transmission": 1.0,
+      "position_corrected": true,
+      "position_factor": 0.94,
+      "method": "intrinsic_efficiency",
+      "gross_counts": 5200.0,
+      "background_counts": 400.0,
+      "net_peak_area": 4800.0,
+      "net_corrected": 4898.0,
+      "sigma_counts": 74.6,
+      "activity_MBq": 1.02,
+      "sigma_activity_MBq": 0.03,
+      "count_rate_cps": 16.66,
+      "valid": true,
+      "below_min_counts": false,
+      "hotspot_offset_m": 0.18,
+      "slant_distance_m": 0.605
+    }
+  ]
+}
+```
+
 ## State publication behavior
 
 ### C++ detector state
@@ -540,7 +587,7 @@ The following checks were run during the migration:
 - Periodic state republishing replaces ROS durability/latching; it does not provide durable retained state. Late joiners wait for the next publication.
 - `cloud_meta` and binary `cloud` are separate messages. Consumers must cache the latest metadata and skip or defer a binary cloud received before metadata; there is no transaction binding the pair.
 - Custom JSON schema agreement is documented and hand-maintained between C++ and Python, not generated from one schema. Changes must keep [`messages.hpp`](../include/phds_gegi_driver/messages.hpp), [`command_channel.hpp`](../include/phds_gegi_driver/command_channel.hpp), [`prism_messages.py`](../src/phds_gegi_driver/prism_messages.py), consumers, and this document in lockstep.
-  - **Partially resolved**: all nine message shapes (`Vec3`/`ComptonEvent`/`Spectrum`/`RunInfo`/`DetectorInfo`/`Command`/`CommandResult`/`SourceDirection(s)`/`CloudField`+`CloudMeta`) have been added as first-class typed Prism contracts in `include/prism/types/gegi.hpp` and registered in `src/core/type_registrations.cpp` on the `feature/gegi-driver-types` branch of the `deps/prism` submodule (https://github.com/createc-uk/Prism/tree/feature/gegi-driver-types), pending upstream merge into `develop`. This makes every driver message decodable via Prism's generic `TypeRegistry`/`prism_app`/`prism_cli` tooling by any consumer, without needing this repo's headers. The C++ driver and Python nodes still use their own hand-rolled structs/dicts (field-name casing differs, e.g. `frame_id` vs `frameId`); rewiring them to consume `psm::types::*`/Python bindings directly is deferred future work once that branch merges and, for Python, a wheel with the new types is built (`PSM_BUILD_PYTHON_BINDINGS` is currently `OFF` for this driver). Wire-format compatibility between the hand-rolled schemas and the new `psm::types::*` definitions is enforced by [`test/test_prism_types_coverage.cpp`](../test/test_prism_types_coverage.cpp), a live-NATS integration test: build with `cmake --build build --target test_prism_types_coverage`, run an NATS server, then run `./build/bin/test_prism_types_coverage` (returns exit code 77 if no NATS server is reachable, treated as skipped).
+  - **Partially resolved**: all ten message shapes (`Vec3`/`ComptonEvent`/`Spectrum`/`RunInfo`/`DetectorInfo`/`Command`/`CommandResult`/`SourceDirection(s)`/`CloudField`+`CloudMeta`/`ActivityResult`+`ActivityIsotopeResult`) have been added as first-class typed Prism contracts in `include/prism/types/gegi.hpp` and registered in `src/core/type_registrations.cpp` on the `feature/gegi-driver-types` branch of the `deps/prism` submodule (https://github.com/createc-uk/Prism/tree/feature/gegi-driver-types), pending upstream merge into `develop`. This makes every driver message decodable via Prism's generic `TypeRegistry`/`prism_app`/`prism_cli` tooling by any consumer, without needing this repo's headers. The C++ driver and Python nodes still use their own hand-rolled structs/dicts (field-name casing differs, e.g. `frame_id` vs `frameId`); rewiring them to consume `psm::types::*`/Python bindings directly is deferred future work once that branch merges and, for Python, a wheel with the new types is built (`PSM_BUILD_PYTHON_BINDINGS` is currently `OFF` for this driver). Wire-format compatibility between the hand-rolled schemas and the new `psm::types::*` definitions is enforced by [`test/test_prism_types_coverage.cpp`](../test/test_prism_types_coverage.cpp), a live-NATS integration test: build with `cmake --build build --target test_prism_types_coverage`, run an NATS server, then run `./build/test_prism_types_coverage` (returns exit code 77 if no NATS server is reachable, treated as skipped).
 - Detector state queries use the existing detector control connection while acquisition data uses the existing event connection. The 30-second busy interval retains the conservative policy for reducing detector/firmware contention during acquisition.
 - Timed-acquisition expiry does not clear the driver's local `acquisition_active` flag; see [State publication behavior](#state-publication-behavior).
 
@@ -556,7 +603,7 @@ The following checks were run during the migration:
 - [x] JSONL/N42/CSV/manifest recording path implemented.
 - [x] Build, dependencies, launcher, tools, Docker configuration, tests, and README migrated.
 - [x] Host Prism target, syntax checks, Python checks, unit tests, shell checks, and Compose configuration checks completed.
-- [x] Typed Prism contract coverage added for all driver message shapes (`deps/prism` branch `feature/gegi-driver-types`) with a live-NATS integration test (`test/test_prism_types_coverage.cpp`) proving generic decode without this repo's headers.
+- [x] Typed Prism contract coverage added for all ten driver message shapes, including `ActivityResult` (`deps/prism` branch `feature/gegi-driver-types`) with a live-NATS integration test (`test/test_prism_types_coverage.cpp`) proving generic decode without this repo's headers.
 - [x] Upstream fork-source logic updates (`https://github.com/aliyu-createc/gegi_driver`, commits `3841344`/`f3de1e9`/`51c06bf` past the `1ac1ea4` common ancestor) ported forward: isotope-ID screening layer (`src/phds_gegi_driver/isotope_id.py`, new nuclide library/energy-cal config), position-aware activity calibration in `activity_node.py`, isotope-ID integration into `data_recorder_node.py` and `spherical_heatmap_node.py`, an inline run-info capture + energy-scale correction fix in `socket_comms/tcp_event_reader`, and a `clear_data_and_windows` command in the C++ driver. Ported as logic (not a verbatim merge), since upstream is still ROS1-based and this repo is Prism-based; see `test/test_isotope_id.py` and `test/test_activity_physics.py` (97/97 passing) as the ported-logic acceptance tests. A further upstream methodology improvement -- run-level Currie MDA detection, background subtraction, dead-time correction, and Cs-137:Co-60 ratio reporting -- was ported into `data_recorder_node.py`'s N42 report generation path (`aggregate_run_activity` and friends; see `test/test_n42_activity.py`, 219/219 passing), scoped so `_save_activity_csv()`'s row schema was left unchanged rather than adopting upstream's redesigned one-row-per-detected-line CSV, to avoid breaking downstream DB-ingestion consumers (DB-GEGI-002/004) not in scope. Dead-time correction defaults ON, matching both upstream and this rig's own calibration methodology (isotopes.yaml's calibration-derivation notes, e.g. the Cs137 entry, show the calibration_factor values were fitted with this run-level real/live factor applied on top of activity_node.py's existing per-window correction). `tools/plot_live_spectrum.py`'s peak-label overlay remains unported (cosmetic/visualization only, no messaging or analysis impact) as low-priority follow-up work.
 - [ ] Full Ubuntu 22.04 Docker image build still to be run.
 - [ ] Physical detector plus NATS end-to-end smoke test still to be run.

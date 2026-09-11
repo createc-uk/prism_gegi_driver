@@ -193,15 +193,17 @@ def dead_time_correction_factor(real_time_s, live_time_s, dead_time_percent=None
     and finally to 1.0 (no correction) so a bad run-info read can never fabricate
     or destroy counts.
 
-    IMPORTANT (calibration coupling): the calibration_factor values in
-    isotopes.yaml were fitted against certificated sources using UNCORRECTED
-    activities, so they already absorb the ~2% dead time of the commissioning
-    runs. Turning this correction on therefore REQUIRES re-deriving the
-    calibration factors from dead-time-corrected commissioning data, otherwise
-    the ~2% is applied twice -- see docs/PORTING.md. This is why
-    apply_dead_time_correction defaults to OFF in this driver (unlike the
-    upstream ROS1 fork, which defaults it ON): that recalibration has not been
-    done here yet.
+    IMPORTANT (calibration coupling): activity_node.py's _compute_isotope_activity
+    already applies a PER-WINDOW real/live correction to net_corrected
+    unconditionally (this is upstream logic too, not specific to this fork). This
+    function's correction is a SEPARATE, RUN-LEVEL real/live figure sourced from
+    the detector's own RunInfo query. isotopes.yaml's own calibration-derivation
+    notes (e.g. the Cs137 entry: "CF = 2862790 / (36.2938 cps * 1.00639 dt) =
+    78377") show this rig's calibration factors WERE derived with this run-level
+    factor applied on top of the already-window-corrected cps, matching
+    upstream's default. apply_dead_time_correction therefore defaults to ON here
+    too, consistent with both upstream and how this rig's own calibration_factor
+    values were actually fitted.
     """
     try:
         rt = float(real_time_s)
@@ -606,13 +608,15 @@ class DataRecorderNode(object):
 
         # Apply detector dead-time correction (real/live) to the run-aggregated
         # net areas and activities used for N42 detection/MDA (see
-        # dead_time_correction_factor()). OFF by default here: the
-        # calibration_factor values in isotopes.yaml were fitted against
-        # UNCORRECTED activities, so turning this on without first re-deriving
-        # them from dead-time-corrected commissioning data would double-count
-        # the ~2% dead time.
-        self.apply_dead_time_correction = bool(
-            args.get_bool("apply-dead-time-correction"))
+        # dead_time_correction_factor()). ON by default, matching upstream and
+        # this rig's own calibration methodology: isotopes.yaml's calibration-
+        # derivation notes (e.g. the Cs137 entry) show the calibration_factor
+        # values were fitted WITH this run-level factor applied on top of the
+        # already per-window-corrected net_corrected/cps activity_node.py
+        # reports. Opt out with --no-apply-dead-time-correction if a specific
+        # rig's calibration was fitted without it.
+        self.apply_dead_time_correction = not bool(
+            args.get_bool("no-apply-dead-time-correction"))
 
         # Report configured-but-not-detected nuclides in the N42 as a
         # non-detection with a Currie MDA ("Cs-137 not detected, < X MBq").
@@ -2079,11 +2083,11 @@ def main():
                           "Prefix for the durable measurement identifier", "GEGI")
     app.add_float_option("Recorder", "assay-systematic-uncertainty-percent",
                          "Systematic (non-counting) assay uncertainty, 1 sigma, in percent", 10.6)
-    app.add_bool_option("Recorder", "apply-dead-time-correction",
-                        "Apply detector dead-time (real/live) correction to run-aggregated "
-                        "net areas/activities. OFF by default -- requires isotopes.yaml "
-                        "calibration factors re-derived from dead-time-corrected data first, "
-                        "see dead_time_correction_factor()")
+    app.add_bool_option("Recorder", "no-apply-dead-time-correction",
+                        "Disable run-level detector dead-time (real/live) correction to "
+                        "run-aggregated net areas/activities. Enabled by default, matching "
+                        "how this rig's isotopes.yaml calibration factors were derived; see "
+                        "dead_time_correction_factor()")
     app.add_bool_option("Recorder", "no-report-non-detected-mda",
                         "Disable Currie MDA reporting for configured-but-not-detected "
                         "nuclides in the N42 (enabled by default)")

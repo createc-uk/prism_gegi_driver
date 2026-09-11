@@ -184,46 +184,135 @@ def _median(values):
     return ordered[mid] if n % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
-def aggregate_run_activity(activity_reports, drop_threshold=0.75):
-    """Collapse the per-counting-window activity reports into ONE result per
-    gamma line for the whole run.
+def dead_time_correction_factor(real_time_s, live_time_s, dead_time_percent=None):
+    """Multiplier that converts a RAW net area/activity to a DEAD-TIME-CORRECTED one.
 
-    Activity is computed from TOTAL net counts / TOTAL live time, not by
-    averaging the per-window activities: that weights the windows correctly and
-    is the statistically right estimator for the run.
+    The detector's live-time clock already excludes dead time, so real/live is
+    the exact correction and is preferred. If the real/live counters are missing
+    or nonsensical we fall back to the reported cumulative dead-time percentage,
+    and finally to 1.0 (no correction) so a bad run-info read can never fabricate
+    or destroy counts.
 
-    Partial start-up windows are EXCLUDED. The first window of a run often
-    captures only a few seconds of data but is logged with a FULL live time, so
-    including it drags the activity LOW (measured at -6.8% on a real run).
-
-    The test is on COUNT RATE, not raw counts: a ramp window has partial counts
-    against a full live time, so its rate is anomalously low, while a genuinely
-    shorter window has fewer counts but a NORMAL rate and must be kept. Any
-    window whose net rate falls below `drop_threshold` x the run median rate is
-    dropped.
-
-    Returns {line_label: {activity_MBq, counting_sigma_MBq, net_counts,
-                          live_time_s, windows_used, windows_dropped, ...}}.
+    IMPORTANT (calibration coupling): the calibration_factor values in
+    isotopes.yaml were fitted against certificated sources using UNCORRECTED
+    activities, so they already absorb the ~2% dead time of the commissioning
+    runs. Turning this correction on therefore REQUIRES re-deriving the
+    calibration factors from dead-time-corrected commissioning data, otherwise
+    the ~2% is applied twice -- see docs/PORTING.md. This is why
+    apply_dead_time_correction defaults to OFF in this driver (unlike the
+    upstream ROS1 fork, which defaults it ON): that recalibration has not been
+    done here yet.
     """
+    try:
+        rt = float(real_time_s)
+        lt = float(live_time_s)
+        if rt > 0.0 and lt > 0.0 and lt <= rt:
+            return rt / lt
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = float(dead_time_percent)
+        if 0.0 <= dt < 100.0:
+            return 1.0 / (1.0 - dt / 100.0)
+    except (TypeError, ValueError):
+        pass
+    return 1.0
+
+
+def currie_critical_level(background_counts):
+    """Currie critical level L_C = 2.33*sqrt(B): the net-count DECISION threshold
+    (~95% confidence) above which a line is DETECTED. Background-aware, unlike a
+    fixed count gate."""
+    return 2.33 * math.sqrt(max(0.0, float(background_counts or 0.0)))
+
+
+def currie_mda_bq(total_background_counts, efficiency_product, total_live_time_s):
+    """Currie detection limit L_D converted to activity (Bq).
+
+    L_D = 2.71 + 4.65*sqrt(B) NET counts (95% confidence, Currie 1968), then
+    A = L_D / (K * t_live) with K the efficiency product reported per line by the
+    activity node (A_Bq = net / (K * t_live)). Returns None when it cannot be
+    computed (no efficiency/geometry, or no live time).
+    """
+    try:
+        K = float(efficiency_product)
+        t = float(total_live_time_s)
+    except (TypeError, ValueError):
+        return None
+    if K <= 0.0 or t <= 0.0:
+        return None
+    B = max(0.0, float(total_background_counts or 0.0))
+    L_D = 2.71 + 4.65 * math.sqrt(B)
+    return L_D / (K * t)
+
+
+def aggregate_run_activity(activity_reports, drop_threshold=0.75, dt_factor=1.0,
+                           background_rates=None):
+    """Collapse the per-window activity reports into ONE result per gamma line,
+    deciding DETECTION on the RUN-TOTAL net.
+
+    Detection is a run-level Currie decision: a line is detected when its total
+    net over the whole run exceeds L_C = 2.33*sqrt(B_total), NOT when individual
+    counting windows each clear a fixed count threshold. A weak line (e.g. Co-60's
+    1332 keV) that never crosses the per-window bar but accumulates ample counts
+    over the run is therefore still quantified. The activity node's per-window
+    ``valid`` flag is deliberately IGNORED here - it remains only a live-display
+    hint.
+
+    Activity is TOTAL net / TOTAL live time (correctly window-weighted), scaled by
+    the per-line efficiency product K reported by the activity node
+    (A_Bq = total_net/(K*total_live)); older/synthetic reports without K fall back
+    to the window activity/net scale.
+
+    Partial start-up windows are still EXCLUDED, on COUNT RATE: a ramp window has
+    partial counts against a full logged live time, so its rate is anomalously low
+    (including it dragged a real run -6.8%). A genuinely short window has a NORMAL
+    rate and is kept.
+
+    background_rates (optional) = {label: {net_cps, net_cps_sigma}} from a no-source
+    run: its net counts (rate x live) are subtracted per line, and its variance is
+    folded into the detection threshold AND the counting sigma. This removes both
+    the environmental peaks (e.g. ambient Cs-137) and the zero-background false
+    positives (an empty ROI no longer has L_C = 0).
+
+    Returns {line_label: {...}} for DETECTED lines only; undetected configured
+    lines are reported as MDAs by non_detected_nuclide_mdas().
+    """
+    detection_floor_counts = 5.0
     per_line = {}
     for report in activity_reports:
         live = float(report.get('live_time_s', 0.0) or 0.0)
         for iso in report.get('isotopes', []):
             name = iso.get('isotope', '')
-            if not name or not iso.get('valid'):
-                continue
             net = float(iso.get('net_corrected', 0.0) or 0.0)
-            act = float(iso.get('activity_MBq', 0.0) or 0.0)
-            if net <= 0 or live <= 0 or act <= 0:
+            if not name or net <= 0 or live <= 0:
                 continue
             per_line.setdefault(name, []).append({
-                'net': net, 'live': live, 'act': act,
+                'net': net, 'live': live,
+                'gross': float(iso.get('gross_counts', 0.0) or 0.0),
+                'bg': float(iso.get('background_counts', 0.0) or 0.0),
+                'K': float(iso.get('efficiency_product', 0.0) or 0.0),
+                'act': float(iso.get('activity_MBq', 0.0) or 0.0),
                 'energy_keV': float(iso.get('energy_keV', 0.0) or 0.0),
+                # Position-aware correction provenance (activity node folds the
+                # factor into K, so the activity is already corrected; these
+                # only document it in the N42).
+                'pos_f': float(iso.get('position_factor', 1.0) or 1.0),
+                'slant': float(iso.get('slant_distance_m', 0.0) or 0.0),
             })
 
     results = {}
     for name, windows in per_line.items():
-        median_rate = _median([w['net'] / w['live'] for w in windows])
+        # Reference rate from SUBSTANTIVE windows only: a seconds-long flush
+        # fragment carries huge rate variance and, with only two windows, can
+        # drag the median above the genuine full window's rate - which then
+        # gets dropped as "partial" while the fragment is kept. Fragments are
+        # still rate-filtered and summed normally; they just cannot steer the
+        # reference.
+        max_live = max(w['live'] for w in windows)
+        substantive = [w for w in windows if w['live'] >= 0.1 * max_live]
+        median_rate = _median([w['net'] / w['live']
+                               for w in (substantive or windows)])
         kept = [w for w in windows
                 if median_rate <= 0
                 or (w['net'] / w['live']) >= drop_threshold * median_rate]
@@ -232,22 +321,66 @@ def aggregate_run_activity(activity_reports, drop_threshold=0.75):
             continue
         total_net = sum(w['net'] for w in kept)
         total_live = sum(w['live'] for w in kept)
+        total_bg = sum(w['bg'] for w in kept)
+        total_gross = sum(w['gross'] for w in kept)
         if total_net <= 0 or total_live <= 0:
             continue
-        # Bq per cps is a geometry/efficiency constant for the run; take the
-        # median across windows so one odd window cannot skew the scale.
-        bq_per_cps = _median([w['act'] / (w['net'] / w['live']) for w in kept])
-        activity = bq_per_cps * (total_net / total_live)
+
+        # Optional background subtraction (measured no-source rate).
+        bg_counts = 0.0     # expected background counts in this run's ROI
+        bg_var = 0.0        # variance of that from the background measurement
+        if background_rates and name in background_rates:
+            br = background_rates[name]
+            bg_counts = float(br.get('net_cps', 0.0) or 0.0) * total_live
+            bg_var = (float(br.get('net_cps_sigma', 0.0) or 0.0) * total_live) ** 2
+        net_source = total_net - bg_counts
+
+        # Run-level detection decision (Currie critical level). The subtracted
+        # background and its measurement variance widen L_C, so a clean ROI
+        # (which used to give L_C = 0) and ambient peaks no longer false-positive.
+        # detection_floor_counts guards the residual B~0 pathology: with a truly
+        # empty ROI L_C -> 0 and a couple of stray counts in one short partial
+        # window would otherwise "detect". A handful-of-counts floor is orders
+        # below any genuine assay signal.
+        if net_source <= max(currie_critical_level(total_bg + bg_counts + bg_var),
+                             detection_floor_counts):
+            continue
+        # Activity scale: prefer the reported efficiency product K (activity =
+        # net_source/(K*total_live)); fall back to the window activity/net ratio for
+        # reports predating it. dt_factor (real/live) scales the activity only -
+        # the Poisson statistics below use RAW counts.
+        ks = [w['K'] for w in kept if w['K'] > 0]
+        if ks:
+            activity = (net_source / (_median(ks) * total_live)) * dt_factor / 1.0e6
+        else:
+            ratios = [w['act'] / (w['net'] / w['live'])
+                      for w in kept if w['act'] > 0 and w['net'] > 0]
+            bq_per_cps = _median(ratios) if ratios else 0.0
+            activity = bq_per_cps * (net_source / total_live) * dt_factor
+        # Net-area sigma: Poisson on the raw counts (gross + sideband bg =
+        # net + 2*bg) plus the background-subtraction variance.
+        sigma_net = math.sqrt(total_net + 2.0 * total_bg + bg_var)
+        # Position-corrected windows (factor meaningfully < 1) -> document the
+        # median factor/slant distance in the N42. Uncorrected runs report 1.0.
+        pos_windows = [w for w in kept if w.get('pos_f', 1.0) < 0.999]
         results[name] = {
             'isotope': name,
             'energy_keV': kept[0]['energy_keV'],
             'activity_MBq': activity,
             # Counting statistics ONLY - not the assay uncertainty.
-            'counting_sigma_MBq': activity / math.sqrt(total_net),
-            'net_counts': total_net,
+            'counting_sigma_MBq': (activity * sigma_net / net_source
+                                   if net_source > 0 else 0.0),
+            'net_counts': net_source,
+            'gross_counts': total_gross,
+            'background_counts': total_bg + bg_counts,
             'live_time_s': total_live,
             'windows_used': len(kept),
             'windows_dropped': dropped,
+            'position_corrected': bool(pos_windows),
+            'position_factor': (_median([w['pos_f'] for w in pos_windows])
+                                if pos_windows else 1.0),
+            'slant_distance_m': (_median([w['slant'] for w in pos_windows])
+                                 if pos_windows else 0.0),
         }
     return results
 
@@ -279,6 +412,153 @@ def group_by_radionuclide(line_results, radionuclide_of):
             'lines': sorted(r['isotope'] for r in results),
             'net_counts': sum(r['net_counts'] for r in results),
         }
+    return out
+
+
+def cs137_co60_ratio(nuclides):
+    """Cs-137 : Co-60 ratio for a mixed field, or None unless BOTH are detected.
+
+    Reports two ratios (both as Cs-137 / Co-60):
+      - activity_ratio: the physical isotopic ratio (calibration-corrected).
+      - count_ratio: raw net counts, a calibration-INDEPENDENT fingerprint -
+        useful while the calibration factors are provisional (pre-recalibration).
+
+    Co-60 is the intended PRIMARY reference and Cs-137 the SECONDARY: Co-60's
+    Compton continuum sits under the Cs-137 662 keV peak (raising its background
+    and MDA) but Cs-137 does not reciprocally interfere with the Co-60 peaks.
+    """
+    cs = nuclides.get('Cs-137')
+    co = nuclides.get('Co-60')
+    if not cs or not co:
+        return None
+    a_cs = float(cs.get('activity_MBq', 0.0) or 0.0)
+    a_co = float(co.get('activity_MBq', 0.0) or 0.0)
+    net_cs = float(cs.get('net_counts', 0.0) or 0.0)
+    net_co = float(co.get('net_counts', 0.0) or 0.0)
+    return {
+        'activity_ratio': (a_cs / a_co) if a_co > 0 else None,
+        'count_ratio': (net_cs / net_co) if net_co > 0 else None,
+        'cs137_MBq': a_cs,
+        'co60_MBq': a_co,
+    }
+
+
+def run_line_totals(activity_reports):
+    """Per-line RUN totals (all windows) for EVERY configured line, detected or
+    not: {label: {net, gross, bg, live, energy}}. Used to build a background
+    reference (which needs the undetected lines too)."""
+    out = {}
+    for report in activity_reports:
+        live = float(report.get('live_time_s', 0.0) or 0.0)
+        if live <= 0:
+            continue
+        for iso in report.get('isotopes', []):
+            name = iso.get('isotope', '')
+            if not name:
+                continue
+            t = out.setdefault(name, {'net': 0.0, 'gross': 0.0, 'bg': 0.0,
+                                      'live': 0.0, 'energy': 0.0})
+            t['net'] += float(iso.get('net_corrected', 0.0) or 0.0)
+            t['gross'] += float(iso.get('gross_counts', 0.0) or 0.0)
+            t['bg'] += float(iso.get('background_counts', 0.0) or 0.0)
+            t['live'] += live
+            t['energy'] = float(iso.get('energy_keV', 0.0) or 0.0)
+    return out
+
+
+def build_background_rates(activity_reports):
+    """Per-line background NET RATE (cps) + 1-sigma, from a no-source run, for
+    later subtraction. sigma is the Poisson net-area uncertainty per second:
+    sqrt(gross + sideband_bg) / live. Returns {label: {net_cps, net_cps_sigma}}."""
+    rates = {}
+    for name, t in run_line_totals(activity_reports).items():
+        live = t['live']
+        if live <= 0:
+            continue
+        sigma_counts = math.sqrt(max(0.0, t['gross'] + t['bg']))
+        rates[name] = {
+            'net_cps': t['net'] / live,
+            'net_cps_sigma': sigma_counts / live,
+            'live_time_s': live,
+        }
+    return rates
+
+
+def load_background(path):
+    """Load a background reference written by build_background_rates/save.
+    Returns {label: {net_cps, net_cps_sigma}} or None if absent/unreadable."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return None
+    lines = data.get('lines') if isinstance(data, dict) else None
+    return lines or None
+
+
+def detected_line_labels(activity_reports):
+    """Line labels DETECTED over the run (run-total net exceeds the Currie
+    critical level). Delegates to aggregate_run_activity so the CSV filter, the
+    N42 activities and the MDA decision all share ONE run-level detection rule
+    rather than the activity node's per-window ``valid`` flag.
+    """
+    return set(aggregate_run_activity(activity_reports).keys())
+
+
+def detected_nuclides(activity_reports, radionuclide_of):
+    """Radionuclides detected in the run (>=1 valid window on ANY of their lines).
+
+    Used to filter the CSV at the NUCLIDE level: if Co-60 is seen on 1173 keV,
+    its 1332 keV line is kept too even when that line stayed below the per-window
+    validity threshold - the two Co-60 lines are a consistency pair and dropping
+    one hides that the weaker line is under threshold.
+    """
+    return set(radionuclide_of(l) for l in detected_line_labels(activity_reports))
+
+
+def non_detected_nuclide_mdas(activity_reports, detected, radionuclide_of):
+    """MDA (Bq) for each configured nuclide that was NOT detected in the run.
+
+    A nuclide is a non-detection only if NONE of its lines were detected. Its MDA
+    is bounded by its MOST SENSITIVE line (lowest MDA). Background and live time
+    are summed over the whole run: more counting time -> lower (better) MDA.
+    """
+    total_live = 0.0
+    bg = {}       # label -> summed background counts
+    K = {}        # label -> efficiency product (constant per run)
+    nuclide_of = {}
+    for report in activity_reports:
+        total_live += float(report.get('live_time_s', 0.0) or 0.0)
+        for iso in report.get('isotopes', []):
+            label = iso.get('isotope') or ''
+            if not label:
+                continue
+            bg[label] = bg.get(label, 0.0) + float(iso.get('background_counts', 0.0) or 0.0)
+            kp = float(iso.get('efficiency_product', 0.0) or 0.0)
+            if kp > 0.0:
+                K[label] = kp
+            nuclide_of[label] = radionuclide_of(label)
+
+    lines_by_nuclide = {}
+    for label, nuc in nuclide_of.items():
+        lines_by_nuclide.setdefault(nuc, []).append(label)
+
+    out = {}
+    for nuc, labels in lines_by_nuclide.items():
+        if any(l in detected for l in labels):
+            continue  # nuclide was detected on at least one line
+        candidates = []
+        for l in labels:
+            mda = currie_mda_bq(bg.get(l, 0.0), K.get(l, 0.0), total_live)
+            if mda is not None:
+                candidates.append((mda, l))
+        if not candidates:
+            continue
+        best_mda, best_line = min(candidates)
+        out[nuc] = {'mda_Bq': best_mda, 'line': best_line,
+                    'lines': sorted(labels), 'live_time_s': total_live}
     return out
 
 
@@ -323,6 +603,37 @@ class DataRecorderNode(object):
         # (Exp C), Co-60 coincidence summing 0.05. -> expanded U(k=2) ~= 21.3%.
         self.assay_systematic_uncertainty_pct = args.get_float(
             "assay-systematic-uncertainty-percent")
+
+        # Apply detector dead-time correction (real/live) to the run-aggregated
+        # net areas and activities used for N42 detection/MDA (see
+        # dead_time_correction_factor()). OFF by default here: the
+        # calibration_factor values in isotopes.yaml were fitted against
+        # UNCORRECTED activities, so turning this on without first re-deriving
+        # them from dead-time-corrected commissioning data would double-count
+        # the ~2% dead time.
+        self.apply_dead_time_correction = bool(
+            args.get_bool("apply-dead-time-correction"))
+
+        # Report configured-but-not-detected nuclides in the N42 as a
+        # non-detection with a Currie MDA ("Cs-137 not detected, < X MBq").
+        # A non-detection is evidence only if it carries a limit; without this
+        # the N42 simply omits absent nuclides. Enabled by default (opt out
+        # with --no-report-non-detected-mda).
+        self.report_non_detected_mda = not bool(
+            args.get_bool("no-report-non-detected-mda"))
+
+        # Background subtraction. Record a no-source run once
+        # (--record-background) into background_file; every later run then
+        # subtracts those per-line net rates, removing ambient peaks
+        # (environmental Cs-137) and zero-background false positives from the
+        # Currie detection decision.
+        bg_file = args.get_string("background-file")
+        self.background_file = bg_file or os.path.join(self.output_dir, "background.yaml")
+        self.background_rates = load_background(self.background_file)
+        if self.background_rates:
+            logger.info("Data recorder: background subtraction ON (%d lines from %s)",
+                        len(self.background_rates), self.background_file)
+        self.record_background = bool(args.get_bool("record-background"))
 
         node_name = args.get_string("node-name")
         node_clear_targets = args.get_string("node-clear-targets")
@@ -719,6 +1030,19 @@ class DataRecorderNode(object):
         # (the detector publishes RunInfo periodically; see _on_run_info).
         detector_run_info = self._fetch_detector_run_info_post_stop()
 
+        dt_factor = 1.0
+        if self.apply_dead_time_correction:
+            dt_factor = dead_time_correction_factor(
+                detector_run_info.get('real_time_sec'),
+                detector_run_info.get('live_time_sec'),
+                detector_run_info.get('dead_time_percent'))
+        logger.info("  Dead-time correction factor: %.5f (%s)", dt_factor,
+                   "applied" if self.apply_dead_time_correction else "disabled")
+
+        if self.record_background:
+            self._write_background(activities, measurement_id)
+        background_rates = None if self.record_background else self.background_rates
+
         # Final full-resolution isotope-ID screening pass over the WHOLE run's
         # accumulated spectrum (much better statistics than any one live-window
         # slice), embedded into the N42 as SCREENING <Nuclide> entries.
@@ -739,7 +1063,7 @@ class DataRecorderNode(object):
         # N42 is a complete standards-compliant record (spectrum + activities).
         self._save_n42(prefix, spectrum, real_time_ms, live_time_ms,
                        measurement_id, reference_datetime, activities,
-                       id_results, unknown_peaks)
+                       id_results, unknown_peaks, dt_factor, background_rates)
 
         # Save heatmap raw points CSV (irregular, per-isotope scores)
         try:
@@ -1037,7 +1361,8 @@ class DataRecorderNode(object):
                 pass
 
     def _build_analysis_results_xml(self, activities, measurement_id,
-                                    id_results=None, unknown_peaks=None):
+                                    id_results=None, unknown_peaks=None,
+                                    dt_factor=1.0, background_rates=None):
         """Build the N42 <AnalysisResults> block: the run-level nuclide activities,
         plus (if a nuclide library is configured) SCREENING identifications for
         nuclides the isotope-ID layer sees but the assay layer does not quantify.
@@ -1049,8 +1374,12 @@ class DataRecorderNode(object):
         Activities are aggregated over the run (total net counts / total live
         time, partial start-up windows excluded) and reported per RADIONUCLIDE:
         Co-60's two photopeaks quantify the same nuclide and are averaged.
+        Detection is a run-level Currie decision (aggregate_run_activity); a
+        configured nuclide with no detected line is reported once as a bounded
+        non-detection (Currie MDA) when report_non_detected_mda is enabled.
         """
-        lines = aggregate_run_activity(activities)
+        lines = aggregate_run_activity(activities, dt_factor=dt_factor,
+                                       background_rates=background_rates)
         screening_blocks, screening_remark = screening_xml_block(
             id_results, unknown_peaks, exclude_names=self._screening_exclude_names)
         if not lines and not screening_blocks and not screening_remark:
@@ -1080,46 +1409,102 @@ class DataRecorderNode(object):
                     lines=" ".join(res['lines']), uc=u_count, us=u_sys,
                     ue=u_expanded, spread=res['line_spread_percent']))
 
+        # Non-detections: a configured nuclide with no detected line is reported
+        # ONCE as a bounded non-detection (Currie MDA), which is real evidence -
+        # "screened down to < X and absent" - unlike a silent omission.
+        if self.report_non_detected_mda:
+            detected = set(lines.keys())
+            mdas = non_detected_nuclide_mdas(
+                activities, detected, self._controlled_radionuclide)
+            for name in sorted(mdas):
+                m = mdas[name]
+                mda_bq = m['mda_Bq'] * dt_factor
+                nuclide_xml.append(
+                    '      <Nuclide>\n'
+                    '        <NuclideIdentifiedIndicator>false</NuclideIdentifiedIndicator>\n'
+                    '        <NuclideName>{name}</NuclideName>\n'
+                    '        <NuclideActivityValue units="Bq">0</NuclideActivityValue>\n'
+                    '        <Remark>Not detected. Currie MDA (L_D, 95% confidence) '
+                    '= {mbq:.6g} MBq ({bq:.6g} Bq) over live time {live:.0f} s, '
+                    'bounded by line {line}. The MDA reflects the background under '
+                    'the ROI during this run.</Remark>\n'
+                    '      </Nuclide>'.format(
+                        name=name, mbq=mda_bq / 1.0e6, bq=mda_bq,
+                        live=m['live_time_s'], line=m['line']))
+
         peak_xml = []
         for label in sorted(lines):
             res = lines[label]
             cps = (res['net_counts'] / res['live_time_s']
                    if res['live_time_s'] > 0 else 0.0)
+            pos_note = ''
+            if res.get('position_corrected'):
+                pos_note = (' Position-corrected from imaged hotspot: slant '
+                            'distance {slant:.3f} m, efficiency factor '
+                            '{pf:.4f}.'.format(slant=res['slant_distance_m'],
+                                               pf=res['position_factor']))
             peak_xml.append(
                 '      <Peak>\n'
                 '        <PeakEnergyValue units="keV">{e:.2f}</PeakEnergyValue>\n'
                 '        <PeakNetAreaValue>{net:.1f}</PeakNetAreaValue>\n'
                 '        <PeakNetCountRateValue units="cps">{cps:.4f}</PeakNetCountRateValue>\n'
                 '        <Remark>{label}: {used} window(s) used, {dropped} partial '
-                'window(s) excluded; live time {live:.1f} s.</Remark>\n'
+                'window(s) excluded; live time {live:.1f} s.{pos}</Remark>\n'
                 '      </Peak>'.format(
                     e=res['energy_keV'], net=res['net_counts'], cps=cps,
                     label=label, used=res['windows_used'],
-                    dropped=res['windows_dropped'], live=res['live_time_s']))
+                    dropped=res['windows_dropped'], live=res['live_time_s'],
+                    pos=pos_note))
 
         nuclide_xml.extend(screening_blocks)
 
+        if not nuclide_xml and not peak_xml:
+            return ""
+
         ref = (' radMeasurementReferences="{}"'.format(measurement_id)
                if measurement_id else '')
+
+        # Mixed-field Cs-137 : Co-60 ratio (only when BOTH are detected).
+        ratio_remark = ''
+        ratio = cs137_co60_ratio(nuclides)
+        if ratio is not None:
+            parts = []
+            if ratio['activity_ratio'] is not None:
+                parts.append('activity ratio {:.3g}'.format(ratio['activity_ratio']))
+            if ratio['count_ratio'] is not None:
+                parts.append('raw net-count ratio {:.3g} (calibration-independent)'
+                             .format(ratio['count_ratio']))
+            ratio_remark = (
+                '    <Remark>Mixed field Cs-137 : Co-60 (as Cs-137 / Co-60): '
+                '{parts}. Co-60 is the PRIMARY quantitative reference (two '
+                'self-consistent lines, and unaffected by Cs-137); Cs-137 is '
+                'SECONDARY - its 662 keV peak sits on the Co-60 Compton continuum, '
+                'which raises its background and MDA.</Remark>\n'.format(
+                    parts=', '.join(parts)))
+
         return (
             '  <AnalysisResults{ref}>\n'
             '    <Remark>Activities derived from the accumulated spectrum of this '
-            'measurement. The quoted NuclideActivityUncertaintyValue is the EXPANDED '
-            'uncertainty (k=2, 95%), combining per-run counting statistics with the '
-            'systematic assay uncertainty ({us:.1f}% 1sigma, dominated by source '
-            'position within the tray). It is NOT counting statistics alone.</Remark>\n'
+            'measurement. Detected nuclides quote the EXPANDED uncertainty (k=2, '
+            '95%), combining per-run counting statistics with the systematic assay '
+            'uncertainty ({us:.1f}% 1sigma, dominated by source position within the '
+            'tray); it is NOT counting statistics alone. Non-detected configured '
+            'nuclides carry a Currie MDA.</Remark>\n'
+            '{ratio}'
             '{screening_remark}'
             '    <NuclideAnalysisResults>\n{nuclides}\n'
             '    </NuclideAnalysisResults>\n'
             '    <PeakAnalysisResults>\n{peaks}\n'
             '    </PeakAnalysisResults>\n'
             '  </AnalysisResults>\n'.format(
-                ref=ref, us=u_sys, screening_remark=screening_remark,
+                ref=ref, us=u_sys, ratio=ratio_remark,
+                screening_remark=screening_remark,
                 nuclides="\n".join(nuclide_xml), peaks="\n".join(peak_xml)))
 
     def _save_n42(self, prefix, spectrum, real_time_ms, live_time_ms,
                   measurement_id="", reference_datetime="", activities=None,
-                  id_results=None, unknown_peaks=None):
+                  id_results=None, unknown_peaks=None, dt_factor=1.0,
+                  background_rates=None):
         """Save spectrum in ANSI N42.42 XML format.
 
         The measurement_id is stamped onto <RadMeasurement id=...> so the raw
@@ -1185,7 +1570,8 @@ class DataRecorderNode(object):
             measurement_id=measurement_id,
             reference_datetime=reference_datetime,
             analysis_results=self._build_analysis_results_xml(
-                activities or [], measurement_id, id_results, unknown_peaks)
+                activities or [], measurement_id, id_results, unknown_peaks,
+                dt_factor, background_rates)
         )
 
         with open(filepath, 'w') as f:
@@ -1510,6 +1896,27 @@ class DataRecorderNode(object):
             return 'Co-60'
         return name
 
+    def _write_background(self, activities, measurement_id):
+        """Write this (no-source) run's per-line net rates as the background
+        reference used to subtract from later runs. Also updates the in-memory
+        rates so the very next run subtracts without a relaunch.
+        """
+        rates = build_background_rates(activities)
+        doc = {
+            'source_measurement_id': measurement_id,
+            'note': ('Per-line background NET rate (cps) for subtraction. '
+                     'Re-record on a no-source run with --record-background.'),
+            'lines': rates,
+        }
+        try:
+            with open(self.background_file, 'w') as f:
+                yaml.safe_dump(doc, f, default_flow_style=False)
+            self.background_rates = rates
+            logger.info("  Background reference written: %s (%d lines)",
+                        self.background_file, len(rates))
+        except Exception as e:
+            logger.error("Failed to write background reference: %s", e)
+
     def _save_activity_csv(self, prefix, activities, detector_run_info,
                            run_real_time_ms=0, run_live_time_ms=0,
                            measurement_id="", reference_datetime=""):
@@ -1672,6 +2079,20 @@ def main():
                           "Prefix for the durable measurement identifier", "GEGI")
     app.add_float_option("Recorder", "assay-systematic-uncertainty-percent",
                          "Systematic (non-counting) assay uncertainty, 1 sigma, in percent", 10.6)
+    app.add_bool_option("Recorder", "apply-dead-time-correction",
+                        "Apply detector dead-time (real/live) correction to run-aggregated "
+                        "net areas/activities. OFF by default -- requires isotopes.yaml "
+                        "calibration factors re-derived from dead-time-corrected data first, "
+                        "see dead_time_correction_factor()")
+    app.add_bool_option("Recorder", "no-report-non-detected-mda",
+                        "Disable Currie MDA reporting for configured-but-not-detected "
+                        "nuclides in the N42 (enabled by default)")
+    app.add_string_option("Recorder", "background-file",
+                          "Path to a background reference YAML (per-line net rates) written "
+                          "by --record-background; empty = <output-dir>/background.yaml", "")
+    app.add_bool_option("Recorder", "record-background",
+                        "Record this (no-source) run as the background reference instead of "
+                        "subtracting it from a source run")
     app.add_string_option("Recorder", "node-clear-targets",
                           "Comma-separated list of topic:command pairs to fan out clear_all to",
                           DEFAULT_NODE_CLEAR_TARGETS)

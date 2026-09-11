@@ -1,149 +1,142 @@
 # Porting / cloning this driver to another machine
 
-What a fresh clone needs in order to build, run, and — most importantly — produce
-*correct* activity numbers. Read §1 before anything else: the driver will happily
-run on a different detector and report wrong activities without any error.
+What a fresh clone needs to build, run, and — most importantly — produce
+*correct* activity numbers. Read §1 first: the driver can run on another detector
+while silently reporting incorrect activity if calibration and geometry are not
+recommissioned.
 
----
+## 1. The calibration is detector-specific
 
-## 1. ⚠️ The calibration is DETECTOR-SPECIFIC — read this first
+`config/isotopes.yaml` contains `calibration_factor` values derived for one GeGi
+unit and corrected against certificated sources. The shielding geometry also
+describes one physical rig.
 
-`config/isotopes.yaml` contains `calibration_factor` values that were empirically
-derived **for one specific GeGi unit** and then corrected against certificated
-sources (the Co-60 factors were adjusted by −8.7% and −4.5% during commissioning).
+If the detector or rig changes:
 
-**On a different GeGi detector these numbers are wrong**, and nothing will crash —
-every reported activity will simply be wrong. The same applies to the geometry:
-the 0.325 m bare standoff and the single permanent 5 mm steel plate describe one
-particular frame.
+1. Re-run Experiment B in `docs/DJR_assay_experiments.md` with a certificated
+   source and compare against its decay-corrected certificate.
+2. Update `config/isotopes.yaml`: line calibration factors, shielding geometry,
+   material, and `mu_shield_per_m` where applicable.
+3. Update `test/commissioned.py`, the only test module that deliberately encodes
+   rig-specific values.
+4. Run `bash test/run_tests.sh`. A commissioned-configuration failure means the
+   YAML and declared rig no longer agree.
 
-**If the detector or the rig changes you MUST:**
+Example analysis command:
 
-1. Re-run the efficiency validation (Experiment B in `docs/DJR_assay_experiments.md`):
-   assay a certificated source in the operational geometry and compare against the
-   decay-corrected certificate.
-   ```bash
-   python tools/validate_efficiency.py --csv <run>_activity.csv \
-       --nuclide Co60 --cert-activity 1.130 --cert-date 2026-06-01
-   ```
-2. Update `config/isotopes.yaml` — `calibration_factor` per line, and the
-   `shielding` block (`base_standoff_m`, `plate_thickness_m`, `base_shield_plates`,
-   `material`) plus `mu_shield_per_m` if the shielding material changed.
-3. Update **`test/commissioned.py`** to the new rig. This is the *only* test file
-   that encodes rig-specific values; the physics tests are parameter-driven and
-   need no changes.
-4. Re-run the tests — `TestCommissionedConfiguration` failing is the suite telling
-   you the config and the rig disagree.
-
----
+```bash
+python3 tools/validate_efficiency.py --csv <run>_activity.csv \
+  --nuclide Co60 --cert-activity 1.130 --cert-date 2026-06-01
+```
 
 ## 2. Environment
 
-| | Requirement |
+| Component | Requirement |
 |---|---|
-| ROS | **Melodic** (Python 2.7) |
-| OS | **Ubuntu 18.04** |
-| Windows | Driver cannot run natively — use **WSL2** or **Docker** |
+| C++ | C++20 compiler and CMake 3.20+ |
+| Messaging | Vendored Prism plus a built transport; NATS is enabled by default |
+| Native libraries | Boost system/thread/regex and libsodium |
+| Python | Python 3.8+, Prism bindings, NumPy, PyYAML, SciPy, Matplotlib |
+| Python binding build | Python development headers and OpenCV development libraries |
+| Supported container build | Ubuntu 22.04 (Boost 1.74) |
 
-**ROS Melodic is end-of-life and is not installable on Ubuntu 20.04/22.04/24.04.**
-On a modern machine you have three options:
+The detector driver is Linux-oriented. Plotting tools can run natively on Windows
+and connect directly to Prism/NATS; no ROS or websocket bridge is required.
 
-- **WSL2 / Docker with Ubuntu 18.04** (what the current rig uses; see `docker/`).
-- **Port to ROS Noetic + Python 3.** The code already uses
-  `from __future__ import print_function` and is mostly Python-3-clean, but this
-  needs a real porting pass and re-testing. `package.xml` already carries
-  `ROS_PYTHON_VERSION` conditions for the numpy/yaml dependencies.
-- Keep an Ubuntu 18.04 machine for the driver.
+## 3. Clone and build
 
-**Windows note:** only the plotting tools (`tools/plot_live_spectrum.py`,
-`plot_live_2d_heatmap.py`, `plot_live_heatmap.py`) run natively on Windows — they
-talk to the driver over the **rosbridge websocket on port 9090**. They need
-`matplotlib` and a websocket client.
-
----
-
-## 3. Build (standard catkin — no bespoke scripts needed)
-
-The `sync.sh` / `build.sh` / `run.sh` helpers on the current machine live *outside*
-the repo and are a WSL convenience only. A clone does not need them:
+Prism has nested submodules:
 
 ```bash
-mkdir -p ~/catkin_ws/src && cd ~/catkin_ws/src
 git clone <repo-url> phds_gegi_driver
-cd ~/catkin_ws
-rosdep install --from-paths src --ignore-src -r -y   # pulls declared deps
-catkin_make                                          # builds deps/radiation_detector_msgs too
-source devel/setup.bash
+cd phds_gegi_driver
+git submodule update --init --recursive
 ```
 
-`deps/radiation_detector_msgs` is vendored in-tree as a proper catkin package, so
-the custom `ComptonEvent` / `Spectrum` messages build automatically.
-
----
-
-## 4. Site-specific settings to change
-
-| Setting | Where | Note |
-|---|---|---|
-| `gegi_ip` (default `192.168.50.109`) | `launch/gegi_driver.launch`, `launch/gegi_full_pipeline.launch` | your network |
-| `gegi_port` (default `27015`) | same | rarely changes |
-| `output_dir` (default `/opt/phds_gegi_driver/data`) | `launch/gegi_full_pipeline.launch`, `launch/data_recorder.launch` | must exist and be writable |
-| Calibration + geometry | `config/isotopes.yaml`, `test/commissioned.py` | **see §1** |
-| Energy calibration | `config/EnergyCal.csv` | detector-specific bin edges |
-
-Override at launch rather than editing defaults:
+Build the C++ driver and Prism CLI:
 
 ```bash
-roslaunch phds_gegi_driver gegi_full_pipeline.launch \
-    gegi_ip:=<detector-ip> output_dir:=$HOME/gegi_data
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ```
 
-The detector accepts **one TCP connection** — the C++ node owns it. Do not open a
-second connection.
+Install the Python bindings separately:
 
----
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install ./deps/prism/bindings/python
+python3 -m pip install numpy PyYAML scipy matplotlib
+```
+
+The standard CMake outputs are `build/bin/phds_gegi_driver_node` and
+`build/bin/prism`.
+
+> The detector transport uses legacy Boost.Asio APIs. The maintained Docker
+> image pins Ubuntu 22.04/Boost 1.74. A host with Boost 1.90 cannot compile the
+> unchanged `tcp_event_reader` until that transport is separately modernised.
+
+## 4. Site-specific settings
+
+| Setting | How to override | Note |
+|---|---|---|
+| Detector IP | `DETECTOR_IP` / `GEGI_IP` | Default `192.168.50.109` |
+| Detector port | `DETECTOR_PORT` / `GEGI_PORT` | Default `27015` |
+| Messaging protocol | `PRISM_PROTOCOL` | Default `nats` |
+| Messaging server | `PRISM_SERVER`, `PRISM_PORT` | Default `localhost:4222` |
+| Recorder output | `OUTPUT_DIR` | Default `<repo>/data` |
+| Calibration | `CALIBRATION_FILE`, `ISOTOPES_CONFIG` | Must match the commissioned unit/rig |
+| Driver topics | `config/gegi_driver.yaml` | Prism endpoint-name overrides |
+
+Start NATS, then launch the complete stack:
+
+```bash
+nats-server
+./scripts/run_full_pipeline.sh
+```
+
+Example overrides:
+
+```bash
+DETECTOR_IP=192.168.50.110 OUTPUT_DIR="$HOME/gegi_data" \
+PRISM_SERVER=localhost PRISM_PORT=4222 ./scripts/run_full_pipeline.sh
+```
+
+The detector permits only the connections managed by the C++ driver. External
+applications must consume Prism topics and must not open their own detector link.
 
 ## 5. Verify the clone
 
-Unit tests need **no detector, no roscore, no hardware** — run them first:
+Run tests before connecting hardware:
 
 ```bash
-bash test/run_tests.sh          # 97 tests; -v for verbose
+bash test/run_tests.sh
 ```
 
-The runner auto-detects the ROS distro (`/opt/ros/*`), the catkin workspace
-(`$GEGI_WS`, `~/gegi_ws`, `~/catkin_ws`, or the parent workspace) and the Python
-interpreter. Override with `GEGI_WS=... PYTHON=... bash test/run_tests.sh`.
-
-Interpreting failures:
-
-| Failing suite | Meaning |
-|---|---|
-| `TestCommissionedConfiguration` | The yaml no longer matches the rig. Either a bad edit to `isotopes.yaml`, or a genuine rig change → update `test/commissioned.py`. |
-| `TestStructuralInvariants` | `isotopes.yaml` is malformed or physically impossible (zeroed calibration factor, ROI that no longer brackets its photopeak, …). |
-| Physics / tools suites | A real regression in the driver maths. These are rig-independent — they should never fail because of a config or hardware change. |
-
-Then check the live system:
+The suite needs no detector or NATS server, but the Prism Python bindings must be
+importable. Then start NATS and inspect live state/data with the Prism CLI:
 
 ```bash
-rostopic hz /compton_event /energy_deposit     # detector streaming?
-rosservice call /detector/get_detector_info    # serial, temperature, bias
+./build/bin/prism hz --protocol nats --ip localhost --port 4222 \
+  --topic gegi.driver.compton_event --window 5
+./build/bin/prism echo --protocol nats --ip localhost --port 4222 \
+  --topic gegi.detector.detector_info --max 1
 ```
 
----
+See `README.md` for command publication examples and
+`docs/PRISM_MIGRATION.md` for the complete interface and schemas.
 
 ## 6. Known gotchas
 
-- **Shell scripts must stay LF.** `.gitattributes` enforces `*.sh text eol=lf`;
-  without it, CRLF line endings break `bash` on Linux.
-- **Python 2 needs an encoding header.** Any source file containing non-ASCII
-  characters (e.g. `—`, `µ`, `§`) needs `# -*- coding: utf-8 -*-` or it raises
-  `SyntaxError` at import.
-- **Executable bit** on the Python nodes must survive the clone for `rosrun`;
-  `catkin_install_python` handles the installed copies.
-- **`/spectrum` publishes per-interval DELTAS, not a cumulative histogram.** The
-  data recorder integrates them. If you change this, every saved N42 will
-  over-count. It is unit-tested (`test/test_spectrum.py::TestDeltaContract`).
-- **Known quirk:** events above the calibrated energy range are counted in the top
-  spectrum bin rather than discarded (documented in `test_spectrum.py`). Harmless
-  for the Cs/Co ROIs.
+- Keep shell scripts LF-terminated; `.gitattributes` enforces this.
+- `gegi.spectrum.histogram` contains per-interval **deltas**. The recorder
+  integrates them; changing this to cumulative counts corrupts saved N42 files.
+- Energies above calibration currently enter the top spectrum bin. This is an
+  existing, tested behavior.
+- Core pub/sub is not retained state. The activity distance and detector state
+  feeds are periodically republished so late subscribers converge.
+- `gegi.heatmap.cloud_meta` and binary `gegi.heatmap.cloud` are separate
+  messages; consumers cache metadata before decoding the 28-byte point layout.
+- Recorder event output is JSONL, not a ROS bag. Replay software must choose its
+  own pacing from event timestamps or a configured rate.

@@ -1,7 +1,0 @@
----
-bool success
-float64 real_time_sec
-float64 live_time_sec
-float64 dead_time_percent
-float64 count_rate_hz
-string message

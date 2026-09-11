@@ -1,6 +1,0 @@
-<library path="lib/libphds_gegi_driver_nodelet">
-	<class name="phds_gegi_driver/phds_gegi_driver" type="phds_gegi_driver::PhdsGegiDriverNodelet"
-		base_class_type="nodelet::Nodelet">
-		<description>phds_gegi_driver</description>
-	</class>
-</library>

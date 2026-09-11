@@ -1,0 +1,3 @@
+[submodule "deps/prism"]
+	path = deps/prism
+	url = git@github.com:createc-uk/Prism.git

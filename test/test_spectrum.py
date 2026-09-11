@@ -13,6 +13,7 @@ cumulative every saved N42 would over-count. That bug would be silent.
 """
 from __future__ import print_function
 
+import json
 import os
 import sys
 import threading
@@ -24,13 +25,13 @@ sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', 'src', 'phds_gegi_driver')))
 
 import spectrum_node as sn  # noqa: E402
+import prism_messages as pmsg  # noqa: E402
 
 
-class _Energy(object):
-    """Stands in for std_msgs/Float64 without needing the message class."""
-
-    def __init__(self, value):
-        self.data = value
+def _Energy(value):
+    """Builds the JSON-encoded DoubleValue message _on_energy now expects
+    (previously a std_msgs/Float64-like stand-in with a `.data` attribute)."""
+    return json.dumps(pmsg.make_double_value(value))
 
 
 def make_node(n_bins=1024, e_max=3000.0):

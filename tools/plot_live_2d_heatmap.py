@@ -2,20 +2,29 @@
 """
 Per-Isotope 2D Heatmap Plotter - Projects spherical heatmap onto Y-Z plane.
 
-Connects via rosbridge and subscribes to:
-  /sphere_heatmap (PointCloud2) - spherical score distribution
-  /source_directions (PoseArray) - peak directions
-  /source_isotopes (String) - isotope identification labels
+Connects directly to the Prism messaging backend (NATS by default, same as
+the C++ driver and the Python processing nodes) and subscribes to:
+  gegi.heatmap.cloud (binary) + gegi.heatmap.cloud_meta (JSON) - spherical
+      score distribution (point cloud + field-layout metadata)
+  gegi.heatmap.source_directions (JSON) - peak directions
+  gegi.heatmap.source_isotopes (text) - isotope identification labels
+  gegi.activity.results (JSON) - per-isotope activity, for dose-rate weighting
 
 Produces a 2D heatmap view (Y vs Z) with isotope-labeled peak markers,
 matching the legacy live_heatmap_node visualization style.
 
+Prerequisites:
+  - The Prism Python bindings must be built and installed (see project
+    README) -- this replaces the old `pip install roslibpy` requirement.
+  - matplotlib, numpy, scipy
+
 Usage:
-  python plot_live_2d_heatmap.py [--host localhost] [--port 9090] [--radius 0.5]
+  python plot_live_2d_heatmap.py --protocol nats --server localhost --port 4222 --radius 0.5
 """
-import argparse
-import base64
+import json
+import os
 import struct
+import sys
 import threading
 
 import numpy as np
@@ -24,50 +33,53 @@ import matplotlib.animation as animation
 from matplotlib.ticker import MultipleLocator
 from matplotlib.colors import Normalize
 from scipy.ndimage import gaussian_filter
-import roslibpy
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "src", "phds_gegi_driver"))
+
+import prism
 
 
-def parse_pointcloud2_xyz_score(msg):
-    """Extract xyz positions and per-isotope scores from rosbridge PointCloud2 JSON."""
-    fields = msg.get('fields', [])
-    field_map = {f['name']: f for f in fields}
-    x_off = field_map['x']['offset']
-    y_off = field_map['y']['offset']
-    z_off = field_map['z']['offset']
-    has_cs137 = 'cs137' in field_map
-    has_co60 = 'co60' in field_map
-    cs137_off = field_map['cs137']['offset'] if has_cs137 else None
-    co60_off = field_map['co60']['offset'] if has_co60 else None
-    has_intensity = 'intensity' in field_map
-    intensity_off = field_map['intensity']['offset'] if has_intensity else None
-
-    step = msg['point_step']
-    raw = base64.b64decode(msg.get('data', ''))
+def parse_cloud_binary_xyz_score(data, meta):
+    """Extract xyz positions and per-isotope scores from a raw Prism
+    heatmap-cloud binary payload, using the field layout advertised by the
+    most recent cloud_meta message."""
+    fields = meta.get("fields", [])
+    point_step = meta.get("point_step", 28)
+    # Fixed offsets matching spherical_heatmap_node's _publish_cloud layout:
+    # x=0, y=4, z=8, rgb=12, intensity=16, cs137=20, co60=24 (4-byte floats)
+    x_off, y_off, z_off = 0, 4, 8
+    has_cs137 = 'cs137' in fields
+    has_co60 = 'co60' in fields
+    cs137_off = 20
+    co60_off = 24
+    has_intensity = 'intensity' in fields
+    intensity_off = 16
 
     points = []
     scores_cs137 = []
     scores_co60 = []
     scores_total = []
-    for i in range(0, len(raw), step):
-        if i + z_off + 4 > len(raw):
+    for i in range(0, len(data), point_step):
+        if i + z_off + 4 > len(data):
             break
-        x = struct.unpack_from('<f', raw, i + x_off)[0]
-        y = struct.unpack_from('<f', raw, i + y_off)[0]
-        z = struct.unpack_from('<f', raw, i + z_off)[0]
+        x = struct.unpack_from('<f', data, i + x_off)[0]
+        y = struct.unpack_from('<f', data, i + y_off)[0]
+        z = struct.unpack_from('<f', data, i + z_off)[0]
         points.append([x, y, z])
 
-        if has_cs137 and i + cs137_off + 4 <= len(raw):
-            scores_cs137.append(struct.unpack_from('<f', raw, i + cs137_off)[0])
+        if has_cs137 and i + cs137_off + 4 <= len(data):
+            scores_cs137.append(struct.unpack_from('<f', data, i + cs137_off)[0])
         else:
             scores_cs137.append(0.0)
 
-        if has_co60 and i + co60_off + 4 <= len(raw):
-            scores_co60.append(struct.unpack_from('<f', raw, i + co60_off)[0])
+        if has_co60 and i + co60_off + 4 <= len(data):
+            scores_co60.append(struct.unpack_from('<f', data, i + co60_off)[0])
         else:
             scores_co60.append(0.0)
 
-        if has_intensity and i + intensity_off + 4 <= len(raw):
-            scores_total.append(struct.unpack_from('<f', raw, i + intensity_off)[0])
+        if has_intensity and i + intensity_off + 4 <= len(data):
+            scores_total.append(struct.unpack_from('<f', data, i + intensity_off)[0])
         else:
             scores_total.append(0.0)
 
@@ -80,7 +92,8 @@ def parse_pointcloud2_xyz_score(msg):
 
 
 class PerIsotopeHeatmapPlotter(object):
-    def __init__(self, host, port, cloud_topic, peak_topic, isotope_topic, radius):
+    def __init__(self, app, result, connection, cloud_topic, cloud_meta_topic,
+                 peak_topic, isotope_topic, radius):
         self.radius = radius
         self.points = None
         self.iso_scores = None
@@ -91,52 +104,80 @@ class PerIsotopeHeatmapPlotter(object):
         self.gamma_constants = {'Cs-137': 0.0771, 'Co-60': 0.3059}
         self.lock = threading.Lock()
         self.new_data = False
+        self._latest_meta = None
 
         # Grid for 2D projection
         self.grid_res = 200
         self.grid_extent = radius * 1.1  # slightly larger than sphere radius
 
-        self.client = roslibpy.Ros(host=host, port=port)
+        meta_cfg = prism.TextReceiverConfig()
+        meta_cfg.source = cloud_meta_topic
+        self.meta_listener = app.create_text_receiver(result, connection, meta_cfg)
+        self.meta_listener.on_receive(self._meta_cb)
+        self.meta_listener.start()
 
-        self.cloud_listener = roslibpy.Topic(
-            self.client, cloud_topic, 'sensor_msgs/PointCloud2')
-        self.cloud_listener.subscribe(self._cloud_cb)
+        cloud_cfg = prism.BinaryReceiverConfig()
+        cloud_cfg.source = cloud_topic
+        self.cloud_listener = app.create_binary_receiver(result, connection, cloud_cfg)
+        self.cloud_listener.on_receive(self._cloud_cb)
+        self.cloud_listener.start()
 
-        self.peaks_listener = roslibpy.Topic(
-            self.client, peak_topic, 'geometry_msgs/PoseArray')
-        self.peaks_listener.subscribe(self._peaks_cb)
+        peaks_cfg = prism.TextReceiverConfig()
+        peaks_cfg.source = peak_topic
+        self.peaks_listener = app.create_text_receiver(result, connection, peaks_cfg)
+        self.peaks_listener.on_receive(self._peaks_cb)
+        self.peaks_listener.start()
 
-        self.isotope_listener = roslibpy.Topic(
-            self.client, isotope_topic, 'std_msgs/String')
-        self.isotope_listener.subscribe(self._isotope_cb)
+        isotope_cfg = prism.TextReceiverConfig()
+        isotope_cfg.source = isotope_topic
+        self.isotope_listener = app.create_text_receiver(result, connection, isotope_cfg)
+        self.isotope_listener.on_receive(self._isotope_cb)
+        self.isotope_listener.start()
 
-        self.activity_listener = roslibpy.Topic(
-            self.client, '/activity/results', 'std_msgs/String')
-        self.activity_listener.subscribe(self._activity_cb)
+        activity_cfg = prism.TextReceiverConfig()
+        activity_cfg.source = "gegi.activity.results"
+        self.activity_listener = app.create_text_receiver(result, connection, activity_cfg)
+        self.activity_listener.on_receive(self._activity_cb)
+        self.activity_listener.start()
 
-    def _cloud_cb(self, msg):
-        pts, iso_scores = parse_pointcloud2_xyz_score(msg)
+    def _meta_cb(self, message, source=None):
+        try:
+            meta = json.loads(message)
+        except (ValueError, TypeError):
+            return
+        with self.lock:
+            self._latest_meta = meta
+
+    def _cloud_cb(self, data, source=None):
+        with self.lock:
+            meta = self._latest_meta
+        if meta is None:
+            # Binary payload arrived before any metadata - can't parse it yet.
+            return
+        pts, iso_scores = parse_cloud_binary_xyz_score(data, meta)
         with self.lock:
             self.points = pts
             self.iso_scores = iso_scores
             self.new_data = True
 
-    def _peaks_cb(self, msg):
+    def _peaks_cb(self, message, source=None):
+        try:
+            payload = json.loads(message)
+        except (ValueError, TypeError):
+            return
         peaks = []
-        for pose in msg.get('poses', []):
-            pos = pose.get('position', {})
-            peaks.append([pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)])
+        for p in payload.get('points', []):
+            peaks.append([p.get('x', 0), p.get('y', 0), p.get('z', 0)])
         with self.lock:
             self.peaks = peaks
 
-    def _isotope_cb(self, msg):
+    def _isotope_cb(self, message, source=None):
         with self.lock:
-            self.isotope_text = msg.get('data', '')
+            self.isotope_text = message
 
-    def _activity_cb(self, msg):
-        import json
+    def _activity_cb(self, message, source=None):
         try:
-            data = json.loads(msg.get('data', '{}'))
+            data = json.loads(message)
             dose_rates = {}
             # Accumulate activity per display isotope (sum peaks for Co60)
             activities = {}
@@ -241,8 +282,7 @@ class PerIsotopeHeatmapPlotter(object):
         return labels
 
     def run(self):
-        self.client.run()
-        print("Connected to rosbridge. Waiting for heatmap data...")
+        print("Connected. Waiting for heatmap data...")
 
         fig, ax = plt.subplots(figsize=(8, 8), facecolor='black')
         ax.set_facecolor('black')
@@ -379,23 +419,46 @@ class PerIsotopeHeatmapPlotter(object):
         ani = animation.FuncAnimation(fig, update, interval=2000, blit=False)
         plt.tight_layout()
         plt.show()
-        self.client.terminate()
+
+    def stop(self):
+        self.meta_listener.stop()
+        self.cloud_listener.stop()
+        self.peaks_listener.stop()
+        self.isotope_listener.stop()
+        self.activity_listener.stop()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Per-isotope 2D heatmap plotter (via rosbridge)")
-    parser.add_argument("--host", default="localhost", help="rosbridge host")
-    parser.add_argument("--port", type=int, default=9090, help="rosbridge port")
-    parser.add_argument("--cloud-topic", default="/sphere_heatmap", help="PointCloud2 topic")
-    parser.add_argument("--peak-topic", default="/source_directions", help="PoseArray topic")
-    parser.add_argument("--isotope-topic", default="/source_isotopes", help="Isotope ID topic")
-    parser.add_argument("--radius", type=float, default=0.5, help="Sphere radius (m)")
-    args = parser.parse_args()
+    app = prism.Application("plot_live_2d_heatmap", "Per-isotope 2D heatmap plotter", sys.argv)
+    app.add_string_option("PlotLive2dHeatmap", "cloud-topic", "Heatmap point-cloud binary topic",
+                           "gegi.heatmap.cloud")
+    app.add_string_option("PlotLive2dHeatmap", "cloud-meta-topic", "Heatmap point-cloud metadata topic",
+                           "gegi.heatmap.cloud_meta")
+    app.add_string_option("PlotLive2dHeatmap", "peak-topic", "Source-directions topic",
+                           "gegi.heatmap.source_directions")
+    app.add_string_option("PlotLive2dHeatmap", "isotope-topic", "Isotope ID topic",
+                           "gegi.heatmap.source_isotopes")
+    app.add_float_option("PlotLive2dHeatmap", "radius", "Sphere radius (m)", 0.5)
 
-    plotter = PerIsotopeHeatmapPlotter(args.host, args.port, args.cloud_topic,
-                                        args.peak_topic, args.isotope_topic,
-                                        args.radius)
+    result = app.parse()
+    if result is None:
+        sys.exit(1)
+    app.init_logger(result)
+
+    connection = app.create_connection(result)
+    if connection is None:
+        print("Could not connect to messaging backend - is the server running?")
+        sys.exit(1)
+
+    plotter = PerIsotopeHeatmapPlotter(app, result, connection,
+                                        result.get_string("cloud-topic"),
+                                        result.get_string("cloud-meta-topic"),
+                                        result.get_string("peak-topic"),
+                                        result.get_string("isotope-topic"),
+                                        result.get_float("radius"))
     plotter.run()
+    plotter.stop()
+    connection.close()
 
 
 if __name__ == "__main__":

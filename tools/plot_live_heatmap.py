@@ -1,56 +1,63 @@
 #!/usr/bin/env python
 """
-Live Spherical Heatmap Plotter - Runs natively on Windows via rosbridge websocket.
+Live Spherical Heatmap Plotter - Runs natively on Windows (or any machine)
+via Prism.
 
-Connects to rosbridge_server in the Docker container and subscribes to
-/sphere_heatmap (PointCloud2), /source_directions, and /source_isotopes.
-Displays a 3D scatter plot colored by back-projection score.
+Connects directly to the Prism messaging backend (NATS by default, same as
+the C++ driver and the Python processing nodes) and subscribes to the
+heatmap point-cloud (binary + JSON metadata), source-directions, and
+source-isotopes topics. Displays a 3D scatter plot colored by
+back-projection score.
 
 Prerequisites:
-  - rosbridge running in container (started automatically by full pipeline)
-  - pip install roslibpy matplotlib numpy
+  - The Prism Python bindings must be built and installed (see project
+    README) -- this replaces the old `pip install roslibpy` requirement.
+  - matplotlib, numpy
 
 Usage:
-  python plot_live_heatmap.py [--host localhost] [--port 9090]
+  python plot_live_heatmap.py --protocol nats --server localhost --port 4222
 """
-import argparse
-import base64
+import os
 import struct
+import sys
 import threading
 
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import matplotlib.animation as animation
-import roslibpy
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "src", "phds_gegi_driver"))
+
+import json
+
+import prism
 
 
-def parse_pointcloud2_rosbridge(msg):
-    """Extract xyz and score from a rosbridge PointCloud2 JSON message."""
-    fields = msg.get('fields', [])
-    field_map = {f['name']: f for f in fields}
-    x_off = field_map['x']['offset']
-    y_off = field_map['y']['offset']
-    z_off = field_map['z']['offset']
-    has_rgb = 'rgb' in field_map
-    rgb_off = field_map['rgb']['offset'] if has_rgb else None
-
-    step = msg['point_step']
-    # rosbridge sends data as base64-encoded string
-    raw = base64.b64decode(msg.get('data', ''))
+def parse_cloud_binary(data, meta):
+    """Extract xyz and score from a raw Prism heatmap-cloud binary payload,
+    using the field layout advertised by the most recent cloud_meta message."""
+    fields = meta.get("fields", [])
+    point_step = meta.get("point_step", 28)
+    # Fixed offsets matching spherical_heatmap_node's _publish_cloud layout:
+    # x=0, y=4, z=8, rgb=12, intensity=16, cs137=20, co60=24 (4-byte floats)
+    x_off, y_off, z_off = 0, 4, 8
+    has_rgb = 'rgb' in fields
+    rgb_off = 12
 
     points = []
     scores = []
-    for i in range(0, len(raw), step):
-        if i + z_off + 4 > len(raw):
+    for i in range(0, len(data), point_step):
+        if i + z_off + 4 > len(data):
             break
-        x = struct.unpack_from('<f', raw, i + x_off)[0]
-        y = struct.unpack_from('<f', raw, i + y_off)[0]
-        z = struct.unpack_from('<f', raw, i + z_off)[0]
+        x = struct.unpack_from('<f', data, i + x_off)[0]
+        y = struct.unpack_from('<f', data, i + y_off)[0]
+        z = struct.unpack_from('<f', data, i + z_off)[0]
         points.append([x, y, z])
 
-        if has_rgb and i + rgb_off + 4 <= len(raw):
-            rgb_bytes = struct.unpack_from('<I', raw, i + rgb_off)[0]
+        if has_rgb and i + rgb_off + 4 <= len(data):
+            rgb_bytes = struct.unpack_from('<I', data, i + rgb_off)[0]
             r = (rgb_bytes >> 16) & 0xFF
             scores.append(r / 255.0)
         else:
@@ -60,50 +67,77 @@ def parse_pointcloud2_rosbridge(msg):
 
 
 class LiveHeatmapPlotter(object):
-    def __init__(self, host, port, cloud_topic, peak_topic, isotope_topic):
+    def __init__(self, app, result, connection, cloud_topic, cloud_meta_topic,
+                 peak_topic, isotope_topic):
         self.points = None
         self.scores = None
         self.peak_dirs = []
         self.isotope_text = ""
         self.lock = threading.Lock()
         self.new_data = False
+        self._latest_meta = None
 
-        self.client = roslibpy.Ros(host=host, port=port)
+        meta_cfg = prism.TextReceiverConfig()
+        meta_cfg.source = cloud_meta_topic
+        self.meta_listener = app.create_text_receiver(result, connection, meta_cfg)
+        self.meta_listener.on_receive(self._meta_cb)
+        self.meta_listener.start()
 
-        self.cloud_listener = roslibpy.Topic(
-            self.client, cloud_topic, 'sensor_msgs/PointCloud2')
-        self.cloud_listener.subscribe(self._cloud_cb)
+        cloud_cfg = prism.BinaryReceiverConfig()
+        cloud_cfg.source = cloud_topic
+        self.cloud_listener = app.create_binary_receiver(result, connection, cloud_cfg)
+        self.cloud_listener.on_receive(self._cloud_cb)
+        self.cloud_listener.start()
 
-        self.peaks_listener = roslibpy.Topic(
-            self.client, peak_topic, 'geometry_msgs/PoseArray')
-        self.peaks_listener.subscribe(self._peaks_cb)
+        peaks_cfg = prism.TextReceiverConfig()
+        peaks_cfg.source = peak_topic
+        self.peaks_listener = app.create_text_receiver(result, connection, peaks_cfg)
+        self.peaks_listener.on_receive(self._peaks_cb)
+        self.peaks_listener.start()
 
-        self.isotope_listener = roslibpy.Topic(
-            self.client, isotope_topic, 'std_msgs/String')
-        self.isotope_listener.subscribe(self._isotope_cb)
+        isotope_cfg = prism.TextReceiverConfig()
+        isotope_cfg.source = isotope_topic
+        self.isotope_listener = app.create_text_receiver(result, connection, isotope_cfg)
+        self.isotope_listener.on_receive(self._isotope_cb)
+        self.isotope_listener.start()
 
-    def _cloud_cb(self, msg):
-        pts, scores = parse_pointcloud2_rosbridge(msg)
+    def _meta_cb(self, message, source=None):
+        try:
+            meta = json.loads(message)
+        except (ValueError, TypeError):
+            return
+        with self.lock:
+            self._latest_meta = meta
+
+    def _cloud_cb(self, data, source=None):
+        with self.lock:
+            meta = self._latest_meta
+        if meta is None:
+            # Binary payload arrived before any metadata - can't parse it yet.
+            return
+        pts, scores = parse_cloud_binary(data, meta)
         with self.lock:
             self.points = pts
             self.scores = scores
             self.new_data = True
 
-    def _peaks_cb(self, msg):
+    def _peaks_cb(self, message, source=None):
+        try:
+            payload = json.loads(message)
+        except (ValueError, TypeError):
+            return
         dirs = []
-        for pose in msg.get('poses', []):
-            pos = pose.get('position', {})
-            dirs.append([pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)])
+        for p in payload.get('points', []):
+            dirs.append([p.get('x', 0), p.get('y', 0), p.get('z', 0)])
         with self.lock:
             self.peak_dirs = dirs
 
-    def _isotope_cb(self, msg):
+    def _isotope_cb(self, message, source=None):
         with self.lock:
-            self.isotope_text = msg.get('data', '')
+            self.isotope_text = message
 
     def run(self):
-        self.client.run()
-        print("Connected to rosbridge. Waiting for heatmap data...")
+        print("Connected. Waiting for heatmap data...")
 
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
@@ -154,25 +188,43 @@ class LiveHeatmapPlotter(object):
         ani = animation.FuncAnimation(fig, update, interval=2000, blit=False)
         plt.tight_layout()
         plt.show()
-        self.client.terminate()
+
+    def stop(self):
+        self.meta_listener.stop()
+        self.cloud_listener.stop()
+        self.peaks_listener.stop()
+        self.isotope_listener.stop()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Live GeGI spherical heatmap plotter (via rosbridge)")
-    parser.add_argument("--host", default="localhost", help="rosbridge host (default: localhost)")
-    parser.add_argument("--port", type=int, default=9090, help="rosbridge port (default: 9090)")
-    parser.add_argument("--cloud-topic", default="/sphere_heatmap", help="PointCloud2 topic")
-    parser.add_argument("--peak-topic", default="/source_directions", help="PoseArray peak topic")
-    parser.add_argument("--isotope-topic", default="/source_isotopes", help="Isotope ID topic")
-    args = parser.parse_args()
+    app = prism.Application("plot_live_heatmap", "Live GeGI spherical heatmap plotter", sys.argv)
+    app.add_string_option("PlotLiveHeatmap", "cloud-topic", "Heatmap point-cloud binary topic",
+                           "gegi.heatmap.cloud")
+    app.add_string_option("PlotLiveHeatmap", "cloud-meta-topic", "Heatmap point-cloud metadata topic",
+                           "gegi.heatmap.cloud_meta")
+    app.add_string_option("PlotLiveHeatmap", "peak-topic", "Source-directions topic",
+                           "gegi.heatmap.source_directions")
+    app.add_string_option("PlotLiveHeatmap", "isotope-topic", "Isotope ID topic",
+                           "gegi.heatmap.source_isotopes")
 
-    plotter = LiveHeatmapPlotter(args.host, args.port, args.cloud_topic,
-                                  args.peak_topic, args.isotope_topic)
+    result = app.parse()
+    if result is None:
+        sys.exit(1)
+    app.init_logger(result)
+
+    connection = app.create_connection(result)
+    if connection is None:
+        print("Could not connect to messaging backend - is the server running?")
+        sys.exit(1)
+
+    plotter = LiveHeatmapPlotter(app, result, connection,
+                                  result.get_string("cloud-topic"),
+                                  result.get_string("cloud-meta-topic"),
+                                  result.get_string("peak-topic"),
+                                  result.get_string("isotope-topic"))
     plotter.run()
-
-
-if __name__ == "__main__":
-    main()
+    plotter.stop()
+    connection.close()
 
 
 if __name__ == "__main__":

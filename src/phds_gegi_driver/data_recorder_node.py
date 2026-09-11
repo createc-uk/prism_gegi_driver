@@ -2,44 +2,75 @@
 """
 Data Recorder Node - Saves acquisition data at the end of a timed acquisition.
 
-Wraps the /detector/start_timed_acquisition service with a proxy that:
-  1. Starts rosbag recording of /compton_event
+Wraps the detector's start_timed_acquisition command with a proxy that:
+  1. Starts newline-delimited-JSON (.jsonl) recording of Compton events
   2. Accumulates spectrum data for N42 export
   3. Collects heatmap peak directions and isotope IDs for CSV export
   4. Collects activity results for CSV export
   5. When the timer expires, stops recording and writes all files
 
-Output files (in ~output_dir, default /opt/phds_gegi_driver/data):
-  - <timestamp>_compton_events.bag
+Output files (in --output-dir, default /opt/phds_gegi_driver/data):
+  - <timestamp>_compton_events.jsonl
   - <timestamp>_spectrum.n42
   - <timestamp>_heatmap.csv
   - <timestamp>_activity.csv
 
-Parameters:
-  ~output_dir (str): Directory for saved files (default: /opt/phds_gegi_driver/data)
+CLI options:
+  --output-dir (str): Directory for saved files (default: /opt/phds_gegi_driver/data)
 
-Services:
-  ~/start_timed_recording (phds_gegi_driver/StartTimedAcquisition):
-    Starts timed acquisition AND recording.
+Command channel (see prism_command_channel.py):
+  gegi.<node-name>.command / command_result, commands:
+    "start_timed_recording" {"duration_minutes": N} - starts timed
+        acquisition AND recording.
+    "stop_recording" - stops recording early and saves data collected so far.
+    "clear_all" - clears the detector hardware plus every downstream node's
+        accumulator buffer.
 """
-from __future__ import print_function
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import csv
+import json
+import logging
 import math
-import os
+import struct
 import threading
 import time
 from datetime import datetime
 
 import numpy as np
-import rospy
-import rosbag
+import prism
 import yaml
-from std_msgs.msg import Float64, String
-from geometry_msgs.msg import PoseArray
-from sensor_msgs.msg import PointCloud2
-from radiation_detector_msgs.msg import ComptonEvent, Spectrum
-from phds_gegi_driver.srv import StartTimedAcquisition, StartTimedAcquisitionRequest, GetRunInfo
+
+import prism_messages as pmsg
+from prism_command_channel import CommandServer, CommandClient
+
+logging.basicConfig(level=logging.INFO,
+                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("data_recorder_node")
+
+# Fixed topic names (not CLI-overridable; see prism_messages.py for schemas).
+COMPTON_EVENT_TOPIC = "gegi.driver.compton_event"
+SPECTRUM_TOPIC = "gegi.spectrum.histogram"
+SOURCE_DIRECTIONS_TOPIC = "gegi.heatmap.source_directions"
+SOURCE_ISOTOPES_TOPIC = "gegi.heatmap.source_isotopes"
+ACTIVITY_RESULTS_TOPIC = "gegi.activity.results"
+EFFECTIVE_SOURCE_DISTANCE_TOPIC = "gegi.activity.effective_source_distance"
+CLOUD_TOPIC = "gegi.heatmap.cloud"
+CLOUD_META_TOPIC = "gegi.heatmap.cloud_meta"
+
+DETECTOR_COMMAND_TOPIC = "gegi.detector.command"
+DETECTOR_COMMAND_RESULT_TOPIC = "gegi.detector.command_result"
+DETECTOR_RUN_INFO_TOPIC = "gegi.detector.run_info"
+
+DEFAULT_NODE_CLEAR_TARGETS = (
+    "gegi.spherical_heatmap.command:clear,"
+    "gegi.spectrum.command:clear,"
+    "gegi.spectrum_singles.command:clear,"
+    "gegi.activity.command:clear"
+)
 
 
 # Specific gamma-ray dose-rate constants (uSv*m^2 / MBq*h). The authoritative
@@ -70,8 +101,8 @@ def load_gamma_constants(config_path):
             for k, v in (cfg.get('gamma_constants', {}) or {}).items():
                 table[_norm_iso(k)] = float(v)
         except Exception as exc:  # noqa: broad - never let dose weighting crash
-            rospy.logwarn("Could not load gamma_constants from %s: %s",
-                          config_path, exc)
+            logger.warning("Could not load gamma_constants from %s: %s",
+                            config_path, exc)
     return table
 
 
@@ -195,23 +226,25 @@ def group_by_radionuclide(line_results, radionuclide_of):
 
 
 class DataRecorderNode(object):
-    def __init__(self):
-        self.output_dir = rospy.get_param("~output_dir", "/opt/phds_gegi_driver/data")
-        cal_path = rospy.get_param("~calibration_file", "")
+    def __init__(self, app, args, connection):
+        self._app = app
+
+        self.output_dir = args.get_string("output-dir")
+        cal_path = args.get_string("calibration-file")
         self.calibration_file = cal_path
-        self.isotopes_config = rospy.get_param("~isotopes_config", "")
-        self.source_distance_m = rospy.get_param("~source_distance_m", 0.5)
-        self.heatmap_grid_res = rospy.get_param("~heatmap_grid_res", 200)
-        self.run_info_settle_s = rospy.get_param("~run_info_settle_s", 15.0)
-        # How often to poll detector run-info WHILE recording, so the true
-        # dead-time is captured during acquisition (a post-stop query fails once
-        # the detector has stopped/reset). Each poll briefly shares the detector
-        # socket and drops a few events, so keep this coarse.
-        self.run_info_poll_s = rospy.get_param("~run_info_poll_s", 30.0)
+        self.isotopes_config = args.get_string("isotopes-config")
+        self.source_distance_m = args.get_float("source-distance-m")
+        self.heatmap_grid_res = int(args.get_int("heatmap-grid-res"))
+        # NOTE: these two are currently unused (kept for CLI/config parity with
+        # the pre-migration ~params of the same name; the settle/poll logic
+        # they used to gate was removed when run-info became a continuously
+        # published topic instead of an on-demand service - see _on_run_info).
+        self.run_info_settle_s = args.get_float("run-info-settle-s")
+        self.run_info_poll_s = args.get_float("run-info-poll-s")
         # Prefix for the durable measurement identifier written into every asset
         # so the database can link the N42, activity peak rows and heatmaps of a
         # run back to one parent Measurement (spec DB-GEGI-002 / DB-GEGI-004).
-        self.measurement_id_prefix = rospy.get_param("~measurement_id_prefix", "GEGI")
+        self.measurement_id_prefix = args.get_string("measurement-id-prefix")
 
         # Systematic (non-counting) assay uncertainty, 1 sigma, in percent. This is
         # the position-dominated part of the uncertainty budget and is a property of
@@ -231,8 +264,11 @@ class DataRecorderNode(object):
         # certificate 1.5 (Co-60 BH-4103: 3% expanded at k=2 -> 1.5% standard),
         # efficiency transfer 1.1 (Exp B), shielding 1.0 (Exp F), dead-time 0.6
         # (Exp C), Co-60 coincidence summing 0.05. -> expanded U(k=2) ~= 21.3%.
-        self.assay_systematic_uncertainty_pct = rospy.get_param(
-            "~assay_systematic_uncertainty_percent", 10.6)
+        self.assay_systematic_uncertainty_pct = args.get_float(
+            "assay-systematic-uncertainty-percent")
+
+        node_name = args.get_string("node-name")
+        node_clear_targets = args.get_string("node-clear-targets")
 
         # Ensure output dir exists
         if not os.path.exists(self.output_dir):
@@ -247,74 +283,178 @@ class DataRecorderNode(object):
         # Recording state
         self.lock = threading.Lock()
         self.recording = False
-        self.bag = None
+        self._events_file = None
         self.accumulated_spectrum = np.zeros(len(self.bin_edges), dtype=np.uint32)
         self.total_real_time_ms = 0
         self.total_live_time_ms = 0
         self.heatmap_peaks = []  # list of (x, y, z, isotope, activity)
-        self.heatmap_cloud = None  # latest full PointCloud2 (x, y, z, score)
+        self.heatmap_cloud = None  # latest full point cloud (x, y, z, intensity, cs137, co60)
+        self._latest_cloud_meta = None
         self.activity_results = []  # list of activity JSON dicts
         self.recording_start = None
         self.duration_minutes = 0
         self.timer = None
         self.measurement_id = ""
         self.reference_datetime = ""
-        # Latest valid detector run-info captured during the active recording.
+        # Latest valid detector run-info, continuously updated from the
+        # detector's periodically-published gegi.detector.run_info topic.
         self._last_run_info = self._empty_run_info()
         self._run_info_lock = threading.Lock()
 
-        # Proxy service: user calls this instead of /detector/start_timed_acquisition
-        self.record_srv = rospy.Service(
-            "~start_timed_recording", StartTimedAcquisition, self._handle_start)
+        # -- Detector command client (replaces ServiceProxy calls to the C++
+        # driver's start_timed_acquisition/stop_acquisition/clear_data services)
+        det_cmd_send_cfg = prism.TextSenderConfig()
+        det_cmd_send_cfg.destination = DETECTOR_COMMAND_TOPIC
+        det_cmd_sender = app.create_text_sender(args, connection, det_cmd_send_cfg)
 
-        # Stop recording early (saves all data collected so far)
-        from std_srvs.srv import Trigger, TriggerResponse
-        self.stop_srv = rospy.Service("~stop_recording", Trigger, self._handle_stop)
+        det_cmd_recv_cfg = prism.TextReceiverConfig()
+        det_cmd_recv_cfg.source = DETECTOR_COMMAND_RESULT_TOPIC
+        det_cmd_receiver = app.create_text_receiver(args, connection, det_cmd_recv_cfg)
 
-        # One-shot "clear everything" coordinator. /detector/clear_data only
-        # clears the hardware; the ROS nodes keep independent accumulators (the
-        # heatmap holds a rolling ~120 s event buffer), so a hardware clear alone
-        # leaves the live image populated until those buffers age out. This
-        # service fans out to the hardware clear plus every node clear so a single
-        # call resets the whole pipeline.
-        self.node_clear_services = rospy.get_param(
-            "~node_clear_services",
-            ["/spherical_heatmap/clear", "/spectrum/clear",
-             "/spectrum_singles/clear", "/activity/clear"])
-        self.clear_all_srv = rospy.Service("~clear_all", Trigger, self._handle_clear_all)
+        self._detector_client = CommandClient(det_cmd_sender, det_cmd_receiver)
 
-        # Subscribers (always active, but only record when self.recording=True)
-        self.sub_compton = rospy.Subscriber(
-            "/compton_event", ComptonEvent, self._on_compton, queue_size=10000)
-        self.sub_spectrum = rospy.Subscriber(
-            "/spectrum", Spectrum, self._on_spectrum, queue_size=10)
-        self.sub_peaks = rospy.Subscriber(
-            "/source_directions", PoseArray, self._on_peaks, queue_size=5)
-        self.sub_isotopes = rospy.Subscriber(
-            "/source_isotopes", String, self._on_isotopes, queue_size=5)
-        self.sub_activity = rospy.Subscriber(
-            "/activity/results", String, self._on_activity, queue_size=5)
-        self.sub_cloud = rospy.Subscriber(
-            "/sphere_heatmap", PointCloud2, self._on_cloud, queue_size=2)
+        # -- One-shot "clear everything" coordinator. gegi.detector.command's
+        # clear_data only clears the hardware; the other nodes keep independent
+        # accumulators (the heatmap holds a rolling ~120 s event buffer), so a
+        # hardware clear alone leaves the live image populated until those
+        # buffers age out. clear_all fans out to the hardware clear plus every
+        # node clear so a single command resets the whole pipeline.
+        self._node_clear_clients = self._build_node_clear_clients(
+            app, args, connection, node_clear_targets)
+
+        # -- Command channel (replaces the old ~start_timed_recording /
+        # ~stop_recording / ~clear_all services) --------------------------
+        command_topic = "gegi.{}.command".format(node_name)
+        command_result_topic = "gegi.{}.command_result".format(node_name)
+
+        command_recv_cfg = prism.TextReceiverConfig()
+        command_recv_cfg.source = command_topic
+        command_receiver = app.create_text_receiver(args, connection, command_recv_cfg)
+
+        command_result_cfg = prism.TextSenderConfig()
+        command_result_cfg.destination = command_result_topic
+        command_result_sender = app.create_text_sender(args, connection, command_result_cfg)
+
+        self.command_server = CommandServer(command_receiver, command_result_sender)
+        self.command_server.on("start_timed_recording", self._handle_start)
+        self.command_server.on("stop_recording", self._handle_stop)
+        self.command_server.on("clear_all", self._handle_clear_all)
+        self.command_server.start()
+
+        # -- Subscribers (always active, but only record when self.recording) --
+        compton_cfg = prism.TextReceiverConfig()
+        compton_cfg.source = COMPTON_EVENT_TOPIC
+        self.sub_compton = app.create_text_receiver(args, connection, compton_cfg)
+        self.sub_compton.on_receive(self._on_compton)
+        self.sub_compton.start()
+
+        spectrum_cfg = prism.TextReceiverConfig()
+        spectrum_cfg.source = SPECTRUM_TOPIC
+        self.sub_spectrum = app.create_text_receiver(args, connection, spectrum_cfg)
+        self.sub_spectrum.on_receive(self._on_spectrum)
+        self.sub_spectrum.start()
+
+        peaks_cfg = prism.TextReceiverConfig()
+        peaks_cfg.source = SOURCE_DIRECTIONS_TOPIC
+        self.sub_peaks = app.create_text_receiver(args, connection, peaks_cfg)
+        self.sub_peaks.on_receive(self._on_peaks)
+        self.sub_peaks.start()
+
+        isotopes_cfg = prism.TextReceiverConfig()
+        isotopes_cfg.source = SOURCE_ISOTOPES_TOPIC
+        self.sub_isotopes = app.create_text_receiver(args, connection, isotopes_cfg)
+        self.sub_isotopes.on_receive(self._on_isotopes)
+        self.sub_isotopes.start()
+
+        activity_cfg = prism.TextReceiverConfig()
+        activity_cfg.source = ACTIVITY_RESULTS_TOPIC
+        self.sub_activity = app.create_text_receiver(args, connection, activity_cfg)
+        self.sub_activity.on_receive(self._on_activity)
+        self.sub_activity.start()
+
+        cloud_meta_cfg = prism.TextReceiverConfig()
+        cloud_meta_cfg.source = CLOUD_META_TOPIC
+        self.sub_cloud_meta = app.create_text_receiver(args, connection, cloud_meta_cfg)
+        self.sub_cloud_meta.on_receive(self._on_cloud_meta)
+        self.sub_cloud_meta.start()
+
+        cloud_bin_cfg = prism.BinaryReceiverConfig()
+        cloud_bin_cfg.source = CLOUD_TOPIC
+        self.sub_cloud = app.create_binary_receiver(args, connection, cloud_bin_cfg)
+        self.sub_cloud.on_receive(self._on_cloud)
+        self.sub_cloud.start()
+
         # Track the effective source distance (base standoff + shielding plates)
         # published by the activity node, so saved dose/imaging use the same
         # geometry as the activity estimate.
-        self.sub_distance = rospy.Subscriber(
-            "/activity/effective_source_distance", Float64,
-            self._on_source_distance, queue_size=2)
+        distance_cfg = prism.TextReceiverConfig()
+        distance_cfg.source = EFFECTIVE_SOURCE_DISTANCE_TOPIC
+        self.sub_distance = app.create_text_receiver(args, connection, distance_cfg)
+        self.sub_distance.on_receive(self._on_source_distance)
+        self.sub_distance.start()
 
-        # Latest isotope text for pairing with peaks
+        # Continuous run-info subscription (replaces the old one-shot
+        # rospy.wait_for_service/get_run_info query). The C++ driver now
+        # publishes RunInfo periodically instead of on-demand, so we just keep
+        # the latest valid value cached and read it at stop time.
+        run_info_cfg = prism.TextReceiverConfig()
+        run_info_cfg.source = DETECTOR_RUN_INFO_TOPIC
+        self.sub_run_info = app.create_text_receiver(args, connection, run_info_cfg)
+        self.sub_run_info.on_receive(self._on_run_info)
+        self.sub_run_info.start()
+
+        # Latest isotope text for pairing with peaks (kept for schema-compat /
+        # as a fallback if a source_directions point lacks its own 'isotope'
+        # field; the primary path now reads isotope directly off each point).
         self._latest_isotope_text = ""
         # Latest activity per isotope (name -> MBq)
         self._latest_activity_MBq = {}
 
-        # NOTE: we deliberately do NOT poll run-info during recording. Every
-        # get_run_info call reads and discards a slice of the shared event stream
-        # (see _query_run_info_once), which would make the recorded spectrum/
-        # heatmap unfaithful to the detector. Instead a single query is taken at
-        # stop (_stop_recording), before the acquisition flag is cleared.
+        logger.info("Data recorder node ready. Output dir: %s", self.output_dir)
 
-        rospy.loginfo("Data recorder node ready. Output dir: %s", self.output_dir)
+    @staticmethod
+    def _build_node_clear_clients(app, args, connection, targets_str):
+        """Parse --node-clear-targets ("topic:command,topic:command,...")
+        into one CommandClient per target, reusing the <topic>.command /
+        <topic>.command_result convention used everywhere else."""
+        clients = []
+        for entry in targets_str.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            topic, _, cmd = entry.partition(":")
+            topic = topic.strip()
+            cmd = cmd.strip() or "clear"
+            if topic.endswith(".command"):
+                result_topic = topic[:-len(".command")] + ".command_result"
+            else:
+                result_topic = topic + "_result"
+
+            send_cfg = prism.TextSenderConfig()
+            send_cfg.destination = topic
+            sender = app.create_text_sender(args, connection, send_cfg)
+
+            recv_cfg = prism.TextReceiverConfig()
+            recv_cfg.source = result_topic
+            receiver = app.create_text_receiver(args, connection, recv_cfg)
+
+            clients.append((CommandClient(sender, receiver), cmd, topic))
+        return clients
+
+    def stop(self):
+        self.command_server.stop()
+        self.sub_compton.stop()
+        self.sub_spectrum.stop()
+        self.sub_peaks.stop()
+        self.sub_isotopes.stop()
+        self.sub_activity.stop()
+        self.sub_cloud_meta.stop()
+        self.sub_cloud.stop()
+        self.sub_distance.stop()
+        self.sub_run_info.stop()
+        self._detector_client.close()
+        for client, _cmd, _topic in self._node_clear_clients:
+            client.close()
 
     def _load_energy_cal(self, path):
         if not path or not os.path.exists(path):
@@ -327,107 +467,96 @@ class DataRecorderNode(object):
                     values.append(float(text))
         return np.array(values, dtype=np.float64)
 
-    def _handle_start(self, req):
+    def _handle_start(self, params):
         """Proxy: start timed acquisition on detector + begin recording."""
-        from phds_gegi_driver.srv import StartTimedAcquisitionResponse
-        resp = StartTimedAcquisitionResponse()
+        duration_minutes = params.get("duration_minutes", 0)
 
         with self.lock:
             if self.recording:
-                resp.success = False
-                resp.message = "Already recording. Wait for current acquisition to finish."
-                return resp
+                return False, "Already recording. Wait for current acquisition to finish."
 
-        # Forward to the real detector service
+        # Forward to the real detector command channel
         try:
-            rospy.wait_for_service("/detector/start_timed_acquisition", timeout=5.0)
-            proxy = rospy.ServiceProxy("/detector/start_timed_acquisition", StartTimedAcquisition)
-            det_resp = proxy(req)
-            if not det_resp.success:
-                resp.success = False
-                resp.message = "Detector refused: " + det_resp.message
-                return resp
+            det_result = self._detector_client.call(
+                {"command": "start_timed_acquisition", "duration_minutes": duration_minutes},
+                timeout=5.0)
+            if det_result is None:
+                return False, "Detector command timed out"
+            if not det_result.get("success"):
+                return False, "Detector refused: " + det_result.get("message", "")
         except Exception as e:
-            resp.success = False
-            resp.message = "Failed to call detector service: " + str(e)
-            return resp
+            return False, "Failed to publish detector command: " + str(e)
 
         # Start recording
-        self._start_recording(req.duration_minutes)
+        self._start_recording(duration_minutes)
 
-        resp.success = True
-        resp.message = "Recording started for {} minutes. Files will be saved to {}".format(
-            req.duration_minutes, self.output_dir)
-        return resp
+        return True, "Recording started for {} minutes. Files will be saved to {}".format(
+            duration_minutes, self.output_dir)
 
-    def _handle_stop(self, req):
+    def _handle_stop(self, params):
         """Stop recording early and save all data collected so far."""
-        from std_srvs.srv import TriggerResponse
         with self.lock:
             if not self.recording:
-                return TriggerResponse(success=False, message="Not currently recording.")
+                return False, "Not currently recording."
         # Cancel the timer
         if self.timer:
             self.timer.cancel()
         # Also stop the detector acquisition
         try:
-            from phds_gegi_driver.srv import StopAcquisition
-            rospy.wait_for_service("/detector/stop_acquisition", timeout=5.0)
-            stop_proxy = rospy.ServiceProxy("/detector/stop_acquisition", StopAcquisition)
-            stop_proxy()
+            result = self._detector_client.call({"command": "stop_acquisition"}, timeout=5.0)
+            if result is None or not result.get("success"):
+                logger.warning("Could not stop detector acquisition (may already be stopped)")
         except Exception:
-            rospy.logwarn("Could not stop detector acquisition (may already be stopped)")
+            logger.warning("Could not stop detector acquisition (may already be stopped)")
         # Save data
         self._stop_recording()
-        return TriggerResponse(success=True, message="Recording stopped early. Data saved.")
+        return True, "Recording stopped early. Data saved."
 
-    def _handle_clear_all(self, req):
-        """Clear the detector hardware AND every ROS-side accumulator buffer."""
-        from std_srvs.srv import Trigger, TriggerResponse
-        from phds_gegi_driver.srv import ClearData
-
+    def _handle_clear_all(self, params):
+        """Clear the detector hardware AND every downstream node's accumulator buffer."""
         results = []
         all_ok = True
 
         # 1) Hardware data buffer
         try:
-            rospy.wait_for_service("/detector/clear_data", timeout=3.0)
-            r = rospy.ServiceProxy("/detector/clear_data", ClearData)()
-            ok = bool(r.success)
-            results.append("/detector/clear_data:{}".format("ok" if ok else "fail"))
+            r = self._detector_client.call({"command": "clear_data"}, timeout=3.0)
+            ok = bool(r) and bool(r.get("success"))
+            results.append("{}:{}".format(DETECTOR_COMMAND_TOPIC, "ok" if ok else "fail"))
             all_ok = all_ok and ok
         except Exception as e:
-            results.append("/detector/clear_data:err({})".format(e))
+            results.append("{}:err({})".format(DETECTOR_COMMAND_TOPIC, e))
             all_ok = False
 
-        # 2) ROS node buffers (heatmap event window, spectra, activity window)
-        for name in self.node_clear_services:
+        # 2) Downstream node buffers (heatmap event window, spectra, activity window)
+        for client, cmd, topic in self._node_clear_clients:
             try:
-                rospy.wait_for_service(name, timeout=3.0)
-                r = rospy.ServiceProxy(name, Trigger)()
-                ok = bool(r.success)
-                results.append("{}:{}".format(name, "ok" if ok else "fail"))
+                r = client.call({"command": cmd}, timeout=3.0)
+                ok = bool(r) and bool(r.get("success"))
+                results.append("{}:{}".format(topic, "ok" if ok else "fail"))
                 all_ok = all_ok and ok
             except Exception as e:
-                results.append("{}:err({})".format(name, e))
+                results.append("{}:err({})".format(topic, e))
                 all_ok = False
 
         message = "; ".join(results)
-        rospy.loginfo("clear_all: %s", message)
-        return TriggerResponse(success=all_ok, message=message)
+        logger.info("clear_all: %s", message)
+        return all_ok, message
 
     def _start_recording(self, duration_minutes):
         start_dt = datetime.now()
         timestamp = start_dt.strftime("%Y%m%d_%H%M%S")
-        bag_path = os.path.join(self.output_dir, "{}_compton_events.bag".format(timestamp))
+        events_path = os.path.join(self.output_dir, "{}_compton_events.jsonl".format(timestamp))
 
+        # Do not carry detector timing from a previous run into this recording.
+        # The continuously-published RunInfo callback will populate the cache
+        # again as soon as the driver publishes a valid sample for this run.
         with self._run_info_lock:
             self._last_run_info = self._empty_run_info()
 
         with self.lock:
             self.recording = True
             self.duration_minutes = duration_minutes
-            self.recording_start = rospy.Time.now()
+            self.recording_start = pmsg.now_seconds()
             self.accumulated_spectrum[:] = 0
             self.total_real_time_ms = 0
             self.total_live_time_ms = 0
@@ -440,9 +569,9 @@ class DataRecorderNode(object):
             # ISO-8601 acquisition reference time (spec DB-ACT-003: activity
             # without a reference date/time is not durable).
             self.reference_datetime = start_dt.isoformat()
-            self.bag = rosbag.Bag(bag_path, 'w')
+            self._events_file = open(events_path, 'w')
 
-        rospy.loginfo("Recording started: %d min, bag=%s", duration_minutes, bag_path)
+        logger.info("Recording started: %d min, events_file=%s", duration_minutes, events_path)
 
         # Set a timer to stop recording after the duration
         duration_secs = duration_minutes * 60.0
@@ -452,29 +581,20 @@ class DataRecorderNode(object):
 
     def _stop_recording(self):
         """Called when the timed acquisition ends. Save all files."""
-        rospy.loginfo("Timed acquisition complete. Saving data files...")
-
-        # Single run-info query while the detector is (usually) still acquiring.
-        # We do this ONCE per run rather than polling: each query consumes and
-        # discards a slice of the shared event stream, so one query keeps the
-        # recorded spectrum/heatmap faithful. Cached for the activity CSV below.
-        pre_stop_info = self._query_run_info_once()
-        if pre_stop_info['valid'] and pre_stop_info['real_time_sec'] > 0.0:
-            with self._run_info_lock:
-                self._last_run_info = pre_stop_info
+        logger.info("Timed acquisition complete. Saving data files...")
 
         # Keep recording flag on briefly to capture any final heatmap/activity publishes
         # The heatmap node publishes every ~2s; wait one cycle to get final state.
-        rospy.sleep(3.0)
+        time.sleep(3.0)
 
         # Stop recording and snapshot totals NOW, BEFORE the run-info settle/fetch.
-        # Otherwise the ~15-30 s spent settling and querying detector run-info would
-        # keep accumulating into total_real_time_ms/total_live_time_ms and inflate
-        # the reported run duration (e.g. 5 min -> ~338 s).
+        # Otherwise time spent settling and reading detector run-info would keep
+        # accumulating into total_real_time_ms/total_live_time_ms and inflate the
+        # reported run duration (e.g. 5 min -> ~338 s).
         with self.lock:
             self.recording = False
-            bag = self.bag
-            self.bag = None
+            events_file = self._events_file
+            self._events_file = None
             spectrum = self.accumulated_spectrum.copy()
             real_time_ms = self.total_real_time_ms
             live_time_ms = self.total_live_time_ms
@@ -486,14 +606,14 @@ class DataRecorderNode(object):
             reference_datetime = self.reference_datetime
             duration_minutes = self.duration_minutes
 
-        # Get detector-reported run info once the stream settles (acquisition is
-        # already flagged stopped, so this no longer inflates the run totals).
+        # Get detector-reported run info from the continuously-updated cache
+        # (the detector publishes RunInfo periodically; see _on_run_info).
         detector_run_info = self._fetch_detector_run_info_post_stop()
 
-        # Close bag file
-        if bag:
-            bag.close()
-            rospy.loginfo("  Bag saved: %s_compton_events.bag", prefix)
+        # Close events file
+        if events_file:
+            events_file.close()
+            logger.info("  Events saved: %s_compton_events.jsonl", prefix)
 
         # Save spectrum as N42, with the run's activity results embedded so the
         # N42 is a complete standards-compliant record (spectrum + activities).
@@ -504,19 +624,19 @@ class DataRecorderNode(object):
         try:
             self._save_heatmap_csv(prefix, cloud)
         except Exception as e:
-            rospy.logerr("Failed to save heatmap raw CSV: %s", e)
+            logger.error("Failed to save heatmap raw CSV: %s", e)
 
         # Save heatmap rasterised CSV (regular 5mm Y-Z grid)
         try:
             self._save_heatmap_raster(prefix, cloud, peaks)
         except Exception as e:
-            rospy.logerr("Failed to save heatmap raster CSV: %s", e)
+            logger.error("Failed to save heatmap raster CSV: %s", e)
 
         # Save 3D heatmap grid (Y-Z projection with Gaussian blobs at peaks)
         try:
             self._save_heatmap_3d(prefix, cloud, peaks)
         except Exception as e:
-            rospy.logerr("Failed to save heatmap 3D CSV: %s", e)
+            logger.error("Failed to save heatmap 3D CSV: %s", e)
 
         # Save activity results as CSV
         try:
@@ -524,7 +644,7 @@ class DataRecorderNode(object):
                                     real_time_ms, live_time_ms,
                                     measurement_id, reference_datetime)
         except Exception as e:
-            rospy.logerr("Failed to save activity CSV: %s", e)
+            logger.error("Failed to save activity CSV: %s", e)
 
         # Save the run manifest that links every asset to one parent Measurement
         # (spec DB-GEGI-002 / DB-GEGI-004).
@@ -533,83 +653,108 @@ class DataRecorderNode(object):
                                 duration_minutes, real_time_ms, live_time_ms,
                                 detector_run_info, activities)
         except Exception as e:
-            rospy.logerr("Failed to save run manifest: %s", e)
+            logger.error("Failed to save run manifest: %s", e)
 
-        rospy.loginfo("All data files saved with prefix: %s (measurement_id=%s)",
-                      prefix, measurement_id)
+        logger.info("All data files saved with prefix: %s (measurement_id=%s)",
+                    prefix, measurement_id)
 
     @staticmethod
     def _empty_run_info():
         return {'valid': False, 'dead_time_percent': 0.0, 'real_time_sec': 0.0,
                 'live_time_sec': 0.0, 'message': 'not_queried'}
 
-    def _query_run_info_once(self):
-        """Single, non-blocking-ish query of /detector/get_run_info."""
-        info = self._empty_run_info()
+    def _on_run_info(self, message, source=None):
+        """Callback for the detector's periodically-published RunInfo state.
+
+        Replaces the old one-shot rospy.wait_for_service/get_run_info query:
+        the detector now publishes RunInfo continuously, so we simply keep
+        the latest valid sample cached under a lock.
+        """
         try:
-            rospy.wait_for_service('/detector/get_run_info', timeout=2.0)
-            proxy = rospy.ServiceProxy('/detector/get_run_info', GetRunInfo)
-            resp = proxy()
-            info['message'] = resp.message
-            if resp.success:
-                info['valid'] = True
-                info['dead_time_percent'] = float(resp.dead_time_percent)
-                info['real_time_sec'] = float(resp.real_time_sec)
-                info['live_time_sec'] = float(resp.live_time_sec)
-        except Exception as e:
-            info['message'] = str(e)
-        return info
+            payload = json.loads(message)
+            info = pmsg.parse_run_info(payload)
+        except Exception:
+            return
+        if not info.get('valid'):
+            return
+        normalized = {
+            'valid': True,
+            'dead_time_percent': float(info.get('dead_time_percent', 0.0) or 0.0),
+            'real_time_sec': float(info.get('real_time_sec', 0.0) or 0.0),
+            'live_time_sec': float(info.get('live_time_sec', 0.0) or 0.0),
+            'message': info.get('message', ''),
+        }
+        with self._run_info_lock:
+            self._last_run_info = normalized
 
     def _fetch_detector_run_info_post_stop(self):
-        """Return the run-info captured by the single pre-stop query.
+        """Return the run-info captured by the continuous run-info subscription.
 
-        We do NOT query again here: the detector often resets to idle on stop
-        (returning zeros), and every query discards event-stream data. The
-        pre-stop query in _stop_recording is the one and only read for the run.
+        We do not perform a blocking query here: the detector often resets to
+        idle on stop (which would read as zeros), so the last valid sample
+        received while acquiring is what we want.
         """
         with self._run_info_lock:
             stored = dict(self._last_run_info)
         if stored.get('valid') and stored.get('real_time_sec', 0.0) > 0.0:
-            rospy.loginfo("  Detector run info: real=%.3fs live=%.3fs dead=%.3f%%",
-                          stored['real_time_sec'], stored['live_time_sec'],
-                          stored['dead_time_percent'])
+            logger.info("  Detector run info: real=%.3fs live=%.3fs dead=%.3f%%",
+                        stored['real_time_sec'], stored['live_time_sec'],
+                        stored['dead_time_percent'])
             return stored
 
-        rospy.logwarn("  Detector run info unavailable for this run")
+        logger.warning("  Detector run info unavailable for this run")
         return self._empty_run_info()
 
-    def _on_source_distance(self, msg):
+    def _on_source_distance(self, message, source=None):
         """Track the plate-derived source distance for dose/imaging outputs."""
-        if msg.data > 0 and abs(msg.data - self.source_distance_m) > 1e-4:
-            self.source_distance_m = float(msg.data)
-            rospy.loginfo("Data recorder: source distance -> %.3fm", self.source_distance_m)
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        d = pmsg.parse_double_value(payload)
+        if d is None:
+            return
+        d = float(d)
+        if d > 0 and abs(d - self.source_distance_m) > 1e-4:
+            self.source_distance_m = d
+            logger.info("Data recorder: source distance -> %.3fm", self.source_distance_m)
 
-    def _on_compton(self, msg):
+    def _on_compton(self, message, source=None):
         with self.lock:
-            if not self.recording or self.bag is None:
+            if not self.recording or self._events_file is None:
                 return
             try:
-                self.bag.write("/compton_event", msg, rospy.Time.now())
+                self._events_file.write(message + "\n")
             except Exception:
                 pass
 
-    def _on_spectrum(self, msg):
+    def _on_spectrum(self, message, source=None):
+        try:
+            payload = json.loads(message)
+            spec = pmsg.parse_spectrum(payload)
+        except Exception:
+            return
         with self.lock:
             if not self.recording:
                 return
-            arr = np.array(msg.spectrum, dtype=np.uint32)
+            arr = np.array(spec.get('spectrum', []), dtype=np.uint32)
             n = min(len(arr), len(self.accumulated_spectrum))
             self.accumulated_spectrum[:n] += arr[:n]
-            self.total_real_time_ms += msg.realTime_ms
-            self.total_live_time_ms += (msg.realTime_ms - msg.deadTime_ms)
+            self.total_real_time_ms += spec.get('real_time_ms', 0)
+            self.total_live_time_ms += (spec.get('real_time_ms', 0) - spec.get('dead_time_ms', 0))
 
-    def _on_peaks(self, msg):
+    def _on_peaks(self, message, source=None):
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
         with self.lock:
             if not self.recording:
                 return
             iso_text = self._latest_isotope_text
-            # Parse isotope labels (pipe-separated "Cs-137:count|Co-60:count")
-            isotope_names = []
+            # Fallback isotope labels (pipe-separated "Cs-137:count|Co-60:count"),
+            # used only if a point is missing its own 'isotope' field.
+            fallback_names = []
             if iso_text and iso_text != 'none':
                 for part in iso_text.split('|'):
                     part = part.strip()
@@ -617,58 +762,72 @@ class DataRecorderNode(object):
                         name = part.rsplit(':', 1)[0].strip()
                     else:
                         name = part
-                    isotope_names.append(name)
+                    fallback_names.append(name)
 
-            for i, pose in enumerate(msg.poses):
-                pos = pose.position
-                iso_name = isotope_names[i] if i < len(isotope_names) else "unknown"
+            points = payload.get('points', [])
+            for i, point in enumerate(points):
+                iso_name = point.get('isotope') or (
+                    fallback_names[i] if i < len(fallback_names) else "unknown")
                 activity = self._latest_activity_MBq.get(iso_name, 0.0)
-                self.heatmap_peaks.append((pos.x, pos.y, pos.z, iso_name, activity))
+                self.heatmap_peaks.append(
+                    (point.get('x', 0.0), point.get('y', 0.0), point.get('z', 0.0),
+                     iso_name, activity))
 
-    def _on_cloud(self, msg):
-        """Store the latest sphere heatmap PointCloud2 (overwrite each update)."""
+    def _on_cloud_meta(self, message, source=None):
+        try:
+            meta = json.loads(message)
+        except Exception:
+            return
+        with self.lock:
+            self._latest_cloud_meta = meta
+
+    def _on_cloud(self, data, source=None):
+        """Store the latest sphere heatmap point cloud (overwrite each update)."""
         with self.lock:
             if not self.recording:
                 return
-            # Parse PointCloud2 into numpy arrays
-            import struct as st
-            fields = {f.name: f.offset for f in msg.fields}
-            x_off = fields.get('x', 0)
-            y_off = fields.get('y', 4)
-            z_off = fields.get('z', 8)
-            intensity_off = fields.get('intensity', None)
-            cs137_off = fields.get('cs137', None)
-            co60_off = fields.get('co60', None)
+            meta = self._latest_cloud_meta
+            if meta is None:
+                logger.warning("Received cloud binary before any cloud_meta; skipping")
+                return
 
-            step = msg.point_step
-            raw = msg.data
-            n_points = len(raw) // step if step > 0 else 0
+            fields = meta.get('fields', [])
+            point_step = meta.get('point_step', 28)
+            field_offsets = {name: idx * 4 for idx, name in enumerate(fields)}
+            x_off = field_offsets.get('x', 0)
+            y_off = field_offsets.get('y', 4)
+            z_off = field_offsets.get('z', 8)
+            intensity_off = field_offsets.get('intensity', None)
+            cs137_off = field_offsets.get('cs137', None)
+            co60_off = field_offsets.get('co60', None)
+
+            raw = data
+            n_points = len(raw) // point_step if point_step > 0 else 0
 
             # Columns: x, y, z, intensity, cs137, co60
             points = np.zeros((n_points, 6), dtype=np.float64)
             for idx in range(n_points):
-                offset = idx * step
-                x = st.unpack_from('<f', raw, offset + x_off)[0]
-                y = st.unpack_from('<f', raw, offset + y_off)[0]
-                z = st.unpack_from('<f', raw, offset + z_off)[0]
-                intensity = st.unpack_from('<f', raw, offset + intensity_off)[0] if intensity_off is not None else 0.0
-                cs137 = st.unpack_from('<f', raw, offset + cs137_off)[0] if cs137_off is not None else 0.0
-                co60 = st.unpack_from('<f', raw, offset + co60_off)[0] if co60_off is not None else 0.0
+                offset = idx * point_step
+                x = struct.unpack_from('<f', raw, offset + x_off)[0]
+                y = struct.unpack_from('<f', raw, offset + y_off)[0]
+                z = struct.unpack_from('<f', raw, offset + z_off)[0]
+                intensity = struct.unpack_from('<f', raw, offset + intensity_off)[0] if intensity_off is not None else 0.0
+                cs137 = struct.unpack_from('<f', raw, offset + cs137_off)[0] if cs137_off is not None else 0.0
+                co60 = struct.unpack_from('<f', raw, offset + co60_off)[0] if co60_off is not None else 0.0
                 points[idx] = [x, y, z, intensity, cs137, co60]
 
             self.heatmap_cloud = points
 
-    def _on_isotopes(self, msg):
+    def _on_isotopes(self, message, source=None):
         with self.lock:
-            self._latest_isotope_text = msg.data
+            self._latest_isotope_text = message
 
-    def _on_activity(self, msg):
-        import json
+    def _on_activity(self, message, source=None):
         with self.lock:
             if not self.recording:
                 return
             try:
-                data = json.loads(msg.data)
+                data = json.loads(message)
                 self.activity_results.append(data)
                 # Update latest activity per isotope for heatmap tagging
                 for iso in data.get('isotopes', []):
@@ -800,7 +959,7 @@ class DataRecorderNode(object):
     <RadInstrumentClassCode>Spectroscopic Personal Radiation Detector</RadInstrumentClassCode>
     <RadInstrumentVersion>
       <RadInstrumentComponentName>Software</RadInstrumentComponentName>
-      <RadInstrumentComponentVersion>ros_phds_gegi_driver</RadInstrumentComponentVersion>
+      <RadInstrumentComponentVersion>prism_phds_gegi_driver</RadInstrumentComponentVersion>
     </RadInstrumentVersion>
   </RadInstrumentInformation>
   <RadDetectorInformation>
@@ -836,7 +995,7 @@ class DataRecorderNode(object):
 
         with open(filepath, 'w') as f:
             f.write(n42_xml)
-        rospy.loginfo("  N42 saved: %s", filepath)
+        logger.info("  N42 saved: %s", filepath)
 
     def _save_heatmap_csv(self, prefix, cloud):
         """Save full sphere heatmap as CSV (raw irregular points, background-subtracted)."""
@@ -873,10 +1032,10 @@ class DataRecorderNode(object):
                                          "{:.6f}".format(cs137[i]),
                                          "{:.6f}".format(co60[i])])
                         count += 1
-                rospy.loginfo("  Heatmap raw CSV saved: %s (%d/%d points above threshold)",
-                              filepath, count, len(cloud))
+                logger.info("  Heatmap raw CSV saved: %s (%d/%d points above threshold)",
+                            filepath, count, len(cloud))
             else:
-                rospy.logwarn("  Heatmap raw CSV saved (empty - no cloud data received)")
+                logger.warning("  Heatmap raw CSV saved (empty - no cloud data received)")
 
     @staticmethod
     def _gaussian_smooth(grid, sigma=3.0):
@@ -899,7 +1058,7 @@ class DataRecorderNode(object):
         if cloud is None or len(cloud) == 0:
             with open(filepath, 'w') as f:
                 f.write("x,y,z,intensity_uSv_h,cs137_uSv_h,co60_uSv_h\n")
-            rospy.logwarn("  Heatmap raster CSV saved (empty)")
+            logger.warning("  Heatmap raster CSV saved (empty)")
             return
 
         from scipy.ndimage import gaussian_filter
@@ -999,8 +1158,8 @@ class DataRecorderNode(object):
                         grid_intensity[zi, yi]))
                     count += 1
 
-        rospy.loginfo("  Heatmap raster CSV saved: %s (%d cells, res=%d)",
-                      filepath, count, res)
+        logger.info("  Heatmap raster CSV saved: %s (%d cells, res=%d)",
+                    filepath, count, res)
 
     def _save_heatmap_3d(self, prefix, cloud, peaks):
         """Save 3D heatmap: localized blobs on a flat Y-Z plane at x=distance.
@@ -1021,7 +1180,7 @@ class DataRecorderNode(object):
             with open(filepath, 'w') as f:
                 writer = csv.writer(f)
                 writer.writerow(["x", "y", "z", "dose_rate_uSv_h"])
-            rospy.logwarn("  Heatmap 3D CSV saved (empty - no cloud data)")
+            logger.warning("  Heatmap 3D CSV saved (empty - no cloud data)")
             return
 
         # Fixed 0.5m x 0.5m plane: Y in [-0.5, 0.5], Z in [-0.5, 0.5]
@@ -1076,7 +1235,7 @@ class DataRecorderNode(object):
             unique_peaks[iso_name] = (entry[1], entry[2])  # (py, pz) real-world
 
         if not unique_peaks:
-            rospy.logwarn("  Heatmap 3D: no peaks detected, saving empty file")
+            logger.warning("  Heatmap 3D: no peaks detected, saving empty file")
             with open(filepath, 'w') as f:
                 writer = csv.writer(f)
                 writer.writerow(["x", "y", "z", "dose_rate_uSv_h"])
@@ -1132,8 +1291,8 @@ class DataRecorderNode(object):
                         ])
                         count += 1
 
-        rospy.loginfo("  Heatmap 3D CSV saved: %s (%d hot points of %dx%d grid, %d peaks, x=%.2fm)",
-                      filepath, count, res, res, len(unique_peaks), distance)
+        logger.info("  Heatmap 3D CSV saved: %s (%d hot points of %dx%d grid, %d peaks, x=%.2fm)",
+                    filepath, count, res, res, len(unique_peaks), distance)
 
     # Map the driver's internal isotope/line labels to controlled radionuclide
     # names for the database ActivityResult (spec DB-ACT-001, sec 7.3). The internal
@@ -1174,7 +1333,6 @@ class DataRecorderNode(object):
         DB-ACT-001/002/003 so each processed peak row links to one parent
         Measurement and never loses its unit/reference-date/basis.
         """
-        import json
         filepath = os.path.join(self.output_dir, "{}_activity.csv".format(prefix))
 
         run_real_time_s = run_real_time_ms / 1000.0
@@ -1230,8 +1388,8 @@ class DataRecorderNode(object):
                         reference_datetime
                     ])
 
-        rospy.loginfo("  Activity CSV saved: %s (%d measurement windows)",
-                      filepath, len(activities))
+        logger.info("  Activity CSV saved: %s (%d measurement windows)",
+                    filepath, len(activities))
 
     def _save_manifest(self, prefix, measurement_id, reference_datetime,
                        duration_minutes, run_real_time_ms, run_live_time_ms,
@@ -1242,13 +1400,12 @@ class DataRecorderNode(object):
         the acquisition/processing configuration and the list of raw and
         processed assets produced by this run.
         """
-        import json
         filepath = os.path.join(self.output_dir, "{}_manifest.json".format(prefix))
 
         # Candidate assets with their database role; only list those written.
         candidates = [
             ("{}_spectrum.n42".format(prefix), "raw_spectrum_n42", "N42"),
-            ("{}_compton_events.bag".format(prefix), "raw_compton_events", "rosbag"),
+            ("{}_compton_events.jsonl".format(prefix), "raw_compton_events", "jsonl"),
             ("{}_activity.csv".format(prefix), "processed_peak_results", "CSV"),
             ("{}_heatmap_raw.csv".format(prefix), "gamma_image_raw", "CSV"),
             ("{}_heatmap_raster.csv".format(prefix), "gamma_image_raster", "CSV"),
@@ -1298,14 +1455,52 @@ class DataRecorderNode(object):
         with open(filepath, 'w') as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
 
-        rospy.loginfo("  Manifest saved: %s (%d assets, id=%s)",
-                      filepath, len(assets), measurement_id)
+        logger.info("  Manifest saved: %s (%d assets, id=%s)",
+                    filepath, len(assets), measurement_id)
 
 
 def main():
-    rospy.init_node("data_recorder_node")
-    node = DataRecorderNode()
-    rospy.spin()
+    app = prism.Application("data_recorder_node",
+                             "GeGi timed-acquisition data recorder", sys.argv)
+
+    app.add_string_option("Recorder", "output-dir", "Directory for saved files",
+                          "/opt/phds_gegi_driver/data")
+    app.add_string_option("Recorder", "calibration-file", "Path to EnergyCal.csv (energy bin edges in keV)", "")
+    app.add_string_option("Recorder", "isotopes-config", "Path to isotopes.yaml configuration", "")
+    app.add_float_option("Recorder", "source-distance-m", "Default source-detector distance in metres", 0.5)
+    app.add_int_option("Recorder", "heatmap-grid-res", "3D heatmap grid resolution", 200)
+    app.add_float_option("Recorder", "run-info-settle-s",
+                         "(unused, kept for config parity) run-info settle time in seconds", 15.0)
+    app.add_float_option("Recorder", "run-info-poll-s",
+                         "(unused, kept for config parity) run-info poll interval in seconds", 30.0)
+    app.add_string_option("Recorder", "measurement-id-prefix",
+                          "Prefix for the durable measurement identifier", "GEGI")
+    app.add_float_option("Recorder", "assay-systematic-uncertainty-percent",
+                         "Systematic (non-counting) assay uncertainty, 1 sigma, in percent", 10.6)
+    app.add_string_option("Recorder", "node-clear-targets",
+                          "Comma-separated list of topic:command pairs to fan out clear_all to",
+                          DEFAULT_NODE_CLEAR_TARGETS)
+    app.add_string_option("Recorder", "node-name",
+                          "Used to build gegi.<node-name>.command(_result) topic names",
+                          "data_recorder")
+
+    result = app.parse()
+    if result is None:
+        sys.exit(1)
+    app.init_logger(result)
+
+    connection = app.create_connection(result)
+    if connection is None:
+        logger.error("Could not connect to messaging backend - is the server running?")
+        sys.exit(1)
+
+    node = DataRecorderNode(app, result, connection)
+
+    while app.is_running():
+        time.sleep(0.1)
+
+    node.stop()
+    connection.close()
 
 
 if __name__ == "__main__":

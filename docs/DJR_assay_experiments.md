@@ -12,10 +12,10 @@ thick. Operational geometry: source 0.33 m from the crystal face, one permanent
   `config/isotopes.yaml` is read at **startup**, so calibration/geometry edits
   need a relaunch.
 - Set the plate count (operator sets EXTRA plates; the permanent plate is
-  automatic): `rostopic pub -1 /activity/n_shielding_plates std_msgs/Int32 "data: 0"`
-- Check effective geometry: `rostopic echo -n1 /activity/effective_source_distance`
-  (should read 0.330 with 0 extra plates).
-- Take a timed run: `rosservice call /data_recorder/start_timed_recording '{duration_minutes: N}'`
+  automatic): `prism pub --topic gegi.activity.n_shielding_plates --message '{"dataType":"IntValue","value":0}'`
+- Check effective geometry: `prism echo --topic gegi.activity.effective_source_distance --max 1`
+  (the `DoubleValue.value` should read 0.330 with 0 extra plates).
+- Take a timed run: publish `{"command":"start_timed_recording","duration_minutes":N}` to `gegi.data_recorder.command` and monitor `gegi.data_recorder.command_result`.
 - Outputs land in `data/` (activity CSV, spectrum N42, heatmaps, manifest).
 - Analyse activity vs a certificate: `python tools/validate_efficiency.py --csv <file> --nuclide <Cs137|Co60> --cert-activity <MBq> --cert-date <YYYY-MM-DD> [--tolerance 10]`
 

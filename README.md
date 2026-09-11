@@ -1,215 +1,244 @@
-# ROS PHDS GeGI Driver
+# PHDS GeGi Driver for Prism
 
-## What This Repository Does
+This repository connects a PHDS GeGi detector to a Prism/NATS processing pipeline for spectra, Compton imaging, isotope activity estimation, recording, and live plotting.
 
-This project provides:
+The detector-side boundary has not changed: the C++ driver still speaks the GeGi vendor TCP protocol directly to the detector. Only the network-facing application transport changed—from ROS/catkin/rosbridge interfaces to Prism publishers, subscribers, and command channels carried by NATS.
 
-- A TCP driver that talks to a PHDS GeGI detector over IP/port.
-- A ROS node that publishes Compton events and per-interaction energy deposits.
-- ROS services for detector control (start, stop, clear, run info, detector info, timed acquisitions, bias toggle).
-- A spectrum accumulator node with energy calibration.
-- A spherical heatmap node for directional source localization and isotope identification.
-- Utility scripts for topic monitoring and live plotting.
-
-## Main ROS Interfaces
-
-### Published Topics
-
-**Driver node** (`phds_gegi_driver_node`):
-
-- `/compton_event` (`radiation_detector_msgs/ComptonEvent`): Raw Compton event stream from the detector.
-- `/energy_deposit` (`std_msgs/Float64`): Per-interaction energy in keV.
-
-**Spectrum node** (`spectrum_node.py`):
-
-- `/spectrum` (`radiation_detector_msgs/Spectrum`): Accumulated energy histogram, published at configurable rate.
-
-**Spherical heatmap node** (`spherical_heatmap_node.py`):
-
-- `/sphere_heatmap` (`sensor_msgs/PointCloud2`): Scored sphere grid for RViz visualization.
-- `/source_direction` (`geometry_msgs/PoseStamped`): Peak source direction estimate.
-- `/source_directions` (`geometry_msgs/PoseArray`): All detected direction peaks.
-- `/source_isotopes` (`std_msgs/String`): Isotope identification result.
-
-### Exposed Services
-
-All detector control services are under `/detector/*`:
-
-- `/detector/start_acquisition`
-- `/detector/stop_acquisition`
-- `/detector/clear_data`
-- `/detector/get_run_info`
-- `/detector/get_detector_info`
-- `/detector/toggle_bias_mode`
-- `/detector/start_timed_acquisition` (takes `duration_minutes`)
-
-### Launch Files
-
-| File | Description |
-|------|-------------|
-| `gegi_driver.launch` | Driver node only (TCP connection to detector) |
-| `gegi_full_pipeline.launch` | Driver + spectrum + spherical heatmap + rosbridge websocket |
-| `spectrum.launch` | Standalone spectrum accumulator node |
-| `spherical_heatmap.launch` | Standalone spherical heatmap node |
+For interface mappings and migration detail, see [docs/PRISM_MIGRATION.md](docs/PRISM_MIGRATION.md). This README covers build and day-to-day use only.
 
 ## Prerequisites
 
-### Hardware / Detector
+- A reachable, powered, and cooled GeGi detector (default `192.168.50.109:27015`).
+- Git with submodule support.
+- CMake 3.20+ and a C++20 compiler (GCC 10+, Clang 12+, or MSVC 2019+).
+- Boost system, thread, and regex development libraries.
+- Python 3.8+ with development headers and `pip`.
+- OpenCV development libraries, required when building the vendored Prism Python bindings.
+- Python runtime packages used by the processing/plotting tools: NumPy, PyYAML, SciPy, and Matplotlib.
+- A NATS 2.x server, installed locally or run with Docker.
 
-- Detector powered and cooled (according to PHDS operating guidance).
-- Detector network reachable from the host running Docker.
-- Detector acquisition application on the tablet in the correct recording state.
+On Ubuntu/Debian, the main system packages can be installed with:
 
-### Software
-
-- Docker Desktop (Windows/Linux/macOS).
-- For non-Docker workflows: ROS Melodic-compatible catkin environment.
-
-## Quick Start (Docker)
-
-### 1) Build the image
-
-Run from the repository root:
-
-```powershell
-docker build -t phds_gegi_driver -f .\docker\dockerfiles\phds_gegi_amd64 .
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake git libboost-system-dev libboost-thread-dev libboost-regex-dev python3-dev python3-pip libopencv-dev
 ```
 
-What it does:
+## Clone and initialise submodules
 
-- Builds the ROS workspace and driver into an image named `phds_gegi_driver`.
-- Uses the amd64 Dockerfile in `docker/dockerfiles/phds_gegi_amd64`.
+Prism and its dependencies are vendored as nested submodules, so initialise recursively:
 
-Notes:
-
-- The first build needs internet access because Docker must pull the base ROS image and install apt packages.
-- After the image has been built once, source-only rebuilds can usually run offline as long as Docker cache and the base image are still present locally.
-- If you change the Dockerfile itself or clear the Docker cache, the build may need internet again.
-
-### 2) Run the full pipeline container
-
-```powershell
-docker run --rm -d -p 9090:9090 --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_full_pipeline.launch"
+```bash
+git submodule update --init --recursive
 ```
 
-What it does:
+## Build the C++ driver and Prism CLI
 
-- Starts a container named `gegi_live` in detached mode.
-- Publishes the rosbridge websocket on port 9090 so Windows-side plotting tools can connect.
-- Sources ROS + workspace setup files.
-- Launches driver + spectrum + spherical heatmap + rosbridge via `gegi_full_pipeline.launch`.
+The top-level CMake project builds the GeGi driver against the vendored Prism NATS backend. It deliberately does not build the Python bindings in this build tree.
 
-> **Note:** Do not use `--network host` on Docker Desktop for Windows — it does not actually expose container ports to the host. Use `-p` port mappings instead.
-
-If you only want the detector driver (without spectrum/heatmap), use:
-
-```powershell
-docker run --rm -d -p 9090:9090 --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_driver.launch"
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ```
 
-## Monitoring Topics
+The relevant executables are:
 
-### watch_gegi_topics.ps1
+- `build/bin/phds_gegi_driver_node`
+- `build/bin/prism`
 
-Opens separate PowerShell windows that stream topic output from the running container:
+Optionally install the Prism CLI onto `PATH` with `sudo cmake --install build`; otherwise use `./build/bin/prism` in the examples below.
 
-```powershell
-.\watch_gegi_topics.ps1
+## Install the Prism Python bindings separately
+
+Use a virtual environment if desired, then follow the vendored binding's `scikit-build-core`/`pip` installation path:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install ./deps/prism/bindings/python
+python3 -m pip install numpy PyYAML scipy matplotlib
+python3 -c "import prism; print(prism.__file__)"
 ```
 
-Parameters:
+This separate install is required because the driver CMake project forces `PSM_BUILD_PYTHON_BINDINGS=OFF`. The Python nodes, live plotting tools, and node-importing tests all require `import prism` to succeed in the selected Python environment.
 
-- `-ContainerName <name>`: Specify container explicitly (auto-detects by default).
-- `-Mode echo|hz`: Use `echo` for message content or `hz` for publish rate.
-- `-SampleCount N`: Limit to N messages then stop (echo mode only).
+## Run NATS
 
-### Manual topic inspection
+Run a local server directly:
 
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rostopic echo /compton_event"
+```bash
+nats-server
 ```
 
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rostopic echo /spectrum"
+Or run one with Docker:
+
+```bash
+docker run --rm -d --name gegi-nats -p 4222:4222 nats:latest
 ```
 
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rostopic echo /source_direction"
+The default Prism connection is NATS at `localhost:4222`.
+
+## Run the pipeline
+
+Start the complete stack with the Prism-native launcher:
+
+```bash
+./scripts/run_full_pipeline.sh
 ```
 
-### List all active topics / services
+It starts the C++ driver, main and singles spectrum instances, activity estimator, spherical heatmap, and data recorder, and forwards `SIGINT`/`SIGTERM` to every child process. Connection and detector settings can be overridden with environment variables:
 
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; rostopic list"
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; rosservice list"
+```bash
+PRISM_PROTOCOL=nats PRISM_SERVER=localhost PRISM_PORT=4222 \
+DETECTOR_IP=192.168.50.109 DETECTOR_PORT=27015 \
+OUTPUT_DIR="$PWD/data" ./scripts/run_full_pipeline.sh
 ```
 
-## Plotting Tools
+The old ROS launch XML files have been removed. To run components individually, use the following commands in separate terminals from the repository root (and activate the Python environment in each Python terminal):
 
-Live plotting scripts connect to the ROS container via rosbridge websocket:
-
-| Script | Description |
-|--------|-------------|
-| `tools/plot_live_spectrum.py` | Real-time energy spectrum display |
-| `tools/plot_live_heatmap.py` | Live spherical heatmap visualization |
-| `tools/plot_live_2d_heatmap.py` | Live 2D heatmap projection |
-| `tools/plot_spectrum.ps1` | Static spectrum plot from bag/data |
-| `tools/plot_heatmap.ps1` | Static heatmap plot |
-| `tools/plot_2d_heatmap.ps1` | Static 2D heatmap plot |
-
-## Detector Control via ROS Services
-
-Call services from inside the container:
-
-```powershell
-# Start continuous acquisition
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/start_acquisition"
-
-# Stop acquisition
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/stop_acquisition"
-
-# Clear accumulated data
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/clear_data"
-
-# Start timed acquisition (e.g. 5 minutes)
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/start_timed_acquisition '{duration_minutes: 5}'"
-
-# Get detector info (serial, temperature, bias, battery)
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/get_detector_info"
-
-# Get run info (timing, count-rate)
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/get_run_info"
-
-# Toggle bias mode
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/toggle_bias_mode"
+```bash
+# Detector TCP driver
+./build/bin/phds_gegi_driver_node \
+  --protocol nats --server localhost --port 4222 \
+  --gegi-ip 192.168.50.109 --gegi-port 27015
 ```
 
-## Troubleshooting
-
-### Command returns no output
-
-- Confirm container is running: `docker ps` and verify `gegi_live` exists.
-- Confirm ROS graph is alive with `rostopic list`.
-- Confirm services are available with `rosservice list`.
-
-### Topic exists but no messages
-
-- Start acquisition via the `/detector/start_acquisition` service.
-- Verify detector is physically connected and in recording mode.
-- Check container logs for driver errors:
-
-```powershell
-docker logs gegi_live --tail 200
+```bash
+# Spectrum accumulator
+python3 src/phds_gegi_driver/spectrum_node.py \
+  --protocol nats --server localhost --port 4222 \
+  --calibration-file config/EnergyCal.csv
 ```
 
-## Non-Docker Build (Linux catkin)
+```bash
+# Spherical Compton heatmap
+python3 src/phds_gegi_driver/spherical_heatmap_node.py \
+  --protocol nats --server localhost --port 4222 \
+  --isotopes-config config/isotopes.yaml
+```
 
-1. Create or use an existing catkin workspace.
-2. Put this repository under `<catkin_ws>/src`.
-3. Install dependencies (`setup/phds_gegi_driver/setup_dependencies.sh`).
-4. Build with `catkin_make`.
-5. Run with `roslaunch phds_gegi_driver gegi_driver.launch`.
+```bash
+# Per-isotope activity estimator
+python3 src/phds_gegi_driver/activity_node.py \
+  --protocol nats --server localhost --port 4222 \
+  --calibration-file config/EnergyCal.csv \
+  --isotopes-config config/isotopes.yaml
+```
+
+```bash
+# Timed-acquisition recorder
+python3 src/phds_gegi_driver/data_recorder_node.py \
+  --protocol nats --server localhost --port 4222 \
+  --calibration-file config/EnergyCal.csv \
+  --isotopes-config config/isotopes.yaml \
+  --output-dir data
+```
+
+The launcher also starts the singles spectrum instance on `gegi.spectrum_singles.histogram`. Use each application's `--help` output for additional processing and connection options.
+
+## Docker Compose
+
+The Compose stack builds the Ubuntu 22.04 runtime image, starts NATS, launches the full pipeline, and persists recorder output in the `gegi-data` volume:
+
+```bash
+docker compose up --build
+```
+
+The container must be able to route to the detector IP. Override `DETECTOR_IP`, `DETECTOR_PORT`, or other launcher variables in `docker-compose.yml` or with a Compose override when the site network differs. A driver-only image build is also available through `docker/dockerfiles/phds_gegi_amd64`.
+
+## Prism topics
+
+All application topics use NATS-compatible dot-separated names. The principal interfaces are:
+
+| Area | Topics |
+|---|---|
+| Raw driver data | `gegi.driver.compton_event`, `gegi.driver.energy_deposit`, `gegi.driver.energy_deposit_singles` |
+| Detector state | `gegi.detector.run_info`, `gegi.detector.detector_info`, `gegi.detector.dead_time_percent` |
+| Detector commands | `gegi.detector.command`, `gegi.detector.command_result` |
+| Spectrum | `gegi.spectrum.histogram`, `gegi.spectrum.command`, `gegi.spectrum.command_result` |
+| Heatmap | `gegi.heatmap.cloud` (binary), `gegi.heatmap.cloud_meta`, `gegi.heatmap.source_direction`, `gegi.heatmap.source_directions`, `gegi.heatmap.source_isotopes` |
+| Activity | `gegi.activity.total_activity`, `gegi.activity.results`, `gegi.activity.effective_source_distance`, `gegi.activity.source_distance`, `gegi.activity.n_shielding_plates` |
+| Activity commands | `gegi.activity.command`, `gegi.activity.command_result` |
+| Recorder commands | `gegi.data_recorder.command`, `gegi.data_recorder.command_result` |
+
+`gegi.detector.run_info` and `gegi.detector.detector_info` are continuously published state topics; they replace the former on-demand state services.
+
+## Inspect and publish with the Prism CLI
+
+The Prism CLI uses `--ip`, while Prism applications use `--server`. These examples match the vendored CLI implementation.
+
+```bash
+# Print five spectra
+./build/bin/prism echo --protocol nats --ip localhost --port 4222 \
+  --topic gegi.spectrum.histogram --max 5
+
+# Monitor the event rate (five-second statistics window)
+./build/bin/prism hz --protocol nats --ip localhost --port 4222 \
+  --topic gegi.driver.compton_event --window 5
+
+# Read one state update
+./build/bin/prism echo --protocol nats --ip localhost --port 4222 \
+  --topic gegi.detector.run_info --max 1
+./build/bin/prism echo --protocol nats --ip localhost --port 4222 \
+  --topic gegi.detector.detector_info --max 1
+```
+
+Commands are JSON messages. Subscribe to the result topic before publishing when a response is needed:
+
+```bash
+./build/bin/prism echo --protocol nats --ip localhost --port 4222 \
+  --topic gegi.detector.command_result
+```
+
+```bash
+./build/bin/prism pub --protocol nats --ip localhost --port 4222 \
+  --topic gegi.detector.command \
+  --message '{"command":"start_acquisition","request_id":"cli-start-1"}'
+
+./build/bin/prism pub --protocol nats --ip localhost --port 4222 \
+  --topic gegi.detector.command \
+  --message '{"command":"stop_acquisition","request_id":"cli-stop-1"}'
+```
+
+To start a five-minute acquisition and record all pipeline outputs, subscribe to `gegi.data_recorder.command_result` and publish:
+
+```bash
+./build/bin/prism pub --protocol nats --ip localhost --port 4222 \
+  --topic gegi.data_recorder.command \
+  --message '{"command":"start_timed_recording","duration_minutes":5,"request_id":"cli-record-1"}'
+```
+
+On Windows, `watch_gegi_topics.ps1` opens one Prism CLI watcher per selected text topic. It can run `prism` on the host or inside a running GeGi container; use `Get-Help ./watch_gegi_topics.ps1 -Detailed` or inspect its parameters for target and connection overrides.
+
+## Recorder output
+
+For each timed recording, `data_recorder_node.py` writes timestamp-prefixed assets under `--output-dir`, including:
+
+- `*_compton_events.jsonl`: one raw Compton-event JSON object per line.
+- `*_spectrum.n42`: ANSI N42.42 spectrum data.
+- `*_activity.csv`: isotope activity results.
+- `*_heatmap_raw.csv`, `*_heatmap_raster.csv`, and `*_heatmap_3d.csv`: imaging products.
+- `*_manifest.json`: measurement identity, configuration, and generated-asset index.
+
+## Live plotting
+
+The live plotting tools connect directly to Prism/NATS; no websocket bridge is involved. Run them on any host that can reach NATS and has the Prism Python bindings plus plotting dependencies installed:
+
+```bash
+python3 tools/plot_live_spectrum.py --protocol nats --server localhost --port 4222
+python3 tools/plot_live_heatmap.py --protocol nats --server localhost --port 4222
+python3 tools/plot_live_2d_heatmap.py --protocol nats --server localhost --port 4222
+```
+
+## Tests
+
+```bash
+bash test/run_tests.sh
+```
+
+The tests do not require detector hardware or NATS, but the selected Python 3 environment must have the Prism bindings and the processing dependencies importable.
 
 ## License
 
-Please see [LICENSE.md](LICENSE.md).
+See [LICENSE.md](LICENSE.md).

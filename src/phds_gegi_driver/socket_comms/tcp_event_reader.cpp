@@ -4,8 +4,6 @@
 
 #include <socket_comms/tcp_event_reader.hpp>
 
-#include <ros/ros.h>
-
 #include <cmath>
 #include <chrono>
 #include <cctype>

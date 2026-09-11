@@ -3,30 +3,44 @@
 Spherical Heatmap Node - Projects Compton cone scores onto a sphere.
 
 Maps back-projection scores onto a sphere of configurable radius centered at
-the detector origin. Publishes a PointCloud2 (colored by score) for RViz and
-a PoseStamped for the peak direction.
+the detector origin. Publishes a binary point-cloud blob (colored by score)
+plus a small JSON metadata header, and a source-direction JSON message for
+the peak direction.
 
 This avoids depth ambiguity by only estimating source direction.
 """
-from __future__ import print_function
-
-import csv
-import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import json
+import logging
+import struct
 import threading
+import time
 from collections import deque
 
 import numpy as np
-import rospy
-import struct
+import prism
 import yaml
-from geometry_msgs.msg import PoseStamped, PoseArray, Pose
-from radiation_detector_msgs.msg import ComptonEvent
-from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import Header
-from std_srvs.srv import Trigger, TriggerResponse
-from std_msgs.msg import String
-from std_msgs.msg import Float64
+
+import prism_messages as pmsg
+from prism_command_channel import CommandServer
+
+logging.basicConfig(level=logging.INFO,
+                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("spherical_heatmap_node")
+
+# Fixed topic names (not CLI-overridable; see prism_messages.py for schemas).
+COMPTON_EVENT_TOPIC = "gegi.driver.compton_event"
+CLOUD_TOPIC = "gegi.heatmap.cloud"
+CLOUD_META_TOPIC = "gegi.heatmap.cloud_meta"
+SOURCE_DIRECTION_TOPIC = "gegi.heatmap.source_direction"
+SOURCE_DIRECTIONS_TOPIC = "gegi.heatmap.source_directions"
+SOURCE_ISOTOPES_TOPIC = "gegi.heatmap.source_isotopes"
+ACTIVITY_RESULTS_TOPIC = "gegi.activity.results"
+EFFECTIVE_SOURCE_DISTANCE_TOPIC = "gegi.activity.effective_source_distance"
 
 # Known isotope photo-peak energies (keV) and identification windows
 ISOTOPE_PEAKS = {
@@ -64,8 +78,8 @@ def load_gamma_constants(config_path):
             for k, v in (cfg.get('gamma_constants', {}) or {}).items():
                 table[_norm_iso(k)] = float(v)
         except Exception as exc:  # noqa: broad - never let dose weighting crash
-            rospy.logwarn("Could not load gamma_constants from %s: %s",
-                          config_path, exc)
+            logger.warning("Could not load gamma_constants from %s: %s",
+                            config_path, exc)
     return table
 
 
@@ -112,56 +126,60 @@ def fibonacci_sphere(n_points):
 
 
 class SphericalHeatmapNode(object):
-    def __init__(self):
+    def __init__(self, app, args, connection):
+        self._app = app
+
         # Dose-rate gamma constants, single-sourced from isotopes.yaml.
-        self.isotopes_config = rospy.get_param("~isotopes_config", "")
+        self.isotopes_config = args.get_string("isotopes-config")
         self.gamma_constants = load_gamma_constants(self.isotopes_config)
 
-        self.radius = rospy.get_param("~radius", 0.5)  # 1m diameter
-        self.n_points = int(rospy.get_param("~n_points", 8000))
-        self.window_s = rospy.get_param("~window_s", 180.0)
-        self.update_period_s = rospy.get_param("~update_period_s", 2.0)
-        self.min_events = int(rospy.get_param("~min_events", 50))
+        self.radius = args.get_float("radius")  # 1m diameter
+        self.n_points = int(args.get_int("n-points"))
+        self.window_s = args.get_float("window-s")
+        self.update_period_s = args.get_float("update-period-s")
+        self.min_events = int(args.get_int("min-events"))
         # Cap on events fed to the live back-projection. Raised so the live image
-        # uses far more of the stream (the raw bag already keeps every event).
+        # uses far more of the stream (the raw jsonl already keeps every event).
         # Cost is O(max_events x n_points) per update; lower it if updates lag.
-        self.max_events = int(rospy.get_param("~max_events", 20000))
-        self.sigma_floor = rospy.get_param("~sigma_floor", 0.04)
-        self.max_uncertainty = rospy.get_param("~max_uncertainty", 0.15)
-        self.hemisphere_only = rospy.get_param("~hemisphere_only", True)
-        self.max_peaks = int(rospy.get_param("~max_peaks", 5))
-        self.peak_min_separation_deg = rospy.get_param("~peak_min_separation_deg", 25.0)
+        self.max_events = int(args.get_int("max-events"))
+        self.sigma_floor = args.get_float("sigma-floor")
+        self.max_uncertainty = args.get_float("max-uncertainty")
+        self.hemisphere_only = not args.get_bool("no-hemisphere-only")
+        self.max_peaks = int(args.get_int("max-peaks"))
+        self.peak_min_separation_deg = args.get_float("peak-min-separation-deg")
         # Fraction of the strongest peak a secondary source must reach to be
         # reported. Off-axis sources back-project weaker than on-axis ones (lower
         # detection efficiency), so a high gate (0.75) makes similar-activity
         # off-axis sources flicker in/out around the threshold. 0.5 keeps genuine
         # multi-source scenes stable while still rejecting noise ridges.
-        self.peak_threshold = rospy.get_param("~peak_threshold", 0.5)  # fraction of max score
-        self.refine_peaks = rospy.get_param("~refine_peaks", True)
+        self.peak_threshold = args.get_float("peak-threshold")  # fraction of max score
+        self.refine_peaks = not args.get_bool("no-refine-peaks")
         # Temporal persistence: report a candidate peak only if a same-isotope
         # peak appeared within peak_persist_tol_deg in at least peak_persist_min
         # of the last peak_persist_frames frames (including the current one).
         # Stable real sources pass immediately; flickering ghost peaks from
         # Compton cone cross-talk are rejected. Set peak_persist_min <= 1 to
         # disable. Costs (peak_persist_min - 1) frames of latency for new sources.
-        self.peak_persist_frames = int(rospy.get_param("~peak_persist_frames", 4))
-        self.peak_persist_min = int(rospy.get_param("~peak_persist_min", 2))
-        self.peak_persist_tol_deg = rospy.get_param("~peak_persist_tol_deg", 8.0)
+        self.peak_persist_frames = int(args.get_int("peak-persist-frames"))
+        self.peak_persist_min = int(args.get_int("peak-persist-min"))
+        self.peak_persist_tol_deg = args.get_float("peak-persist-tol-deg")
         self._peak_history = deque(maxlen=max(1, self.peak_persist_frames))
         # Ghost suppression (default: support-based rejection). For each candidate
         # peak, count the events whose Compton cones actually pass through it. A
-        # real source is on the cones of all its own events; a cone-crossing ghost
-        # sits only on coincidental crossings, so its support is far lower. A peak
+        # real source is on the cones of all its own events; a ghost sits only
+        # on coincidental crossings, so its support is far lower. A peak
         # is kept only if its support >= max(min_source_events, support_ratio *
         # strongest peak's support). This uses no event removal / re-solving, so
         # it cannot create new artifacts. Raise support_ratio to reject more
         # ghosts; lower it to keep weaker real sources.
-        self.support_ratio = rospy.get_param("~support_ratio", 0.5)
-        self.min_source_events = int(rospy.get_param("~min_source_events", 15))
-        self.attribution_tol_deg = rospy.get_param("~attribution_tol_deg", 6.0)
+        self.support_ratio = args.get_float("support-ratio")
+        self.min_source_events = int(args.get_int("min-source-events"))
+        self.attribution_tol_deg = args.get_float("attribution-tol-deg")
         # Optional alternative: CLEAN-style iterative extraction (off by default;
         # can over-produce peaks with strong multi-source scenes).
-        self.iterative_extraction = rospy.get_param("~iterative_extraction", False)
+        self.iterative_extraction = args.get_bool("iterative-extraction")
+
+        node_name = args.get_string("node-name")
 
         # Build sphere grid
         all_pts = fibonacci_sphere(self.n_points * (1 if not self.hemisphere_only else 2))
@@ -170,59 +188,139 @@ class SphericalHeatmapNode(object):
             all_pts = all_pts[all_pts[:, 0] > 0]
         self.directions = all_pts / np.linalg.norm(all_pts, axis=1, keepdims=True)
         self.sphere_points = self.directions * self.radius
-        rospy.loginfo("Spherical heatmap: %d points on %.1fm radius sphere",
-                      self.sphere_points.shape[0], self.radius)
+        logger.info("Spherical heatmap: %d points on %.1fm radius sphere",
+                    self.sphere_points.shape[0], self.radius)
 
         self.events = deque()
         self.lock = threading.Lock()
 
         # CSV export settings
-        self.csv_output_dir = rospy.get_param("~csv_output_dir", "/opt/phds_gegi_driver/data")
-        self.csv_enabled = rospy.get_param("~csv_enabled", False)
-        self.raster_cell_m = rospy.get_param("~raster_cell_m", 0.005)  # 5mm cells
-        self.raster_fov_m = rospy.get_param("~raster_fov_m", 0.5)  # +/-0.5m coverage
+        self.csv_output_dir = args.get_string("csv-output-dir")
+        self.csv_enabled = args.get_bool("csv-enabled")
+        self.raster_cell_m = args.get_float("raster-cell-m")  # 5mm cells
+        self.raster_fov_m = args.get_float("raster-fov-m")  # +/-0.5m coverage
 
-        self.sub = rospy.Subscriber("/compton_event", ComptonEvent, self.on_event, queue_size=10000)
-        self.pub_cloud = rospy.Publisher("/sphere_heatmap", PointCloud2, queue_size=2)
-        self.pub_peak = rospy.Publisher("/source_direction", PoseStamped, queue_size=2)
-        self.pub_peaks = rospy.Publisher("/source_directions", PoseArray, queue_size=2)
-        self.pub_isotopes = rospy.Publisher("/source_isotopes", String, queue_size=2)
+        self._log_last_time = {}
 
-        self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
-        self.save_srv = rospy.Service("~save_csv", Trigger, self._handle_save_csv)
+        # -- Senders ----------------------------------------------------------
+        cloud_bin_cfg = prism.BinarySenderConfig()
+        cloud_bin_cfg.destination = CLOUD_TOPIC
+        self.pub_cloud = app.create_binary_sender(args, connection, cloud_bin_cfg)
+
+        cloud_meta_cfg = prism.TextSenderConfig()
+        cloud_meta_cfg.destination = CLOUD_META_TOPIC
+        self.pub_cloud_meta = app.create_text_sender(args, connection, cloud_meta_cfg)
+
+        direction_cfg = prism.TextSenderConfig()
+        direction_cfg.destination = SOURCE_DIRECTION_TOPIC
+        self.pub_direction = app.create_text_sender(args, connection, direction_cfg)
+
+        directions_cfg = prism.TextSenderConfig()
+        directions_cfg.destination = SOURCE_DIRECTIONS_TOPIC
+        self.pub_directions = app.create_text_sender(args, connection, directions_cfg)
+
+        isotopes_cfg = prism.TextSenderConfig()
+        isotopes_cfg.destination = SOURCE_ISOTOPES_TOPIC
+        self.pub_isotopes = app.create_text_sender(args, connection, isotopes_cfg)
+
+        # -- Receivers ----------------------------------------------------------
+        compton_cfg = prism.TextReceiverConfig()
+        compton_cfg.source = COMPTON_EVENT_TOPIC
+        self.sub = app.create_text_receiver(args, connection, compton_cfg)
+        self.sub.on_receive(self.on_event)
+        self.sub.start()
 
         # Subscribe to activity results for absolute dose rate scaling
         self._dose_rate_uSv_h = {}  # isotope display name -> dose rate in uSv/h
-        self.sub_activity = rospy.Subscriber(
-            "/activity/results", String, self._on_activity, queue_size=5)
+        activity_cfg = prism.TextReceiverConfig()
+        activity_cfg.source = ACTIVITY_RESULTS_TOPIC
+        self.sub_activity = app.create_text_receiver(args, connection, activity_cfg)
+        self.sub_activity.on_receive(self._on_activity)
+        self.sub_activity.start()
+
         # Track the plate-derived source distance so the imaging sphere and dose
         # scaling follow the shielding standoff set on the activity node.
-        self.sub_distance = rospy.Subscriber(
-            "/activity/effective_source_distance", Float64,
-            self._on_source_distance, queue_size=2)
+        distance_cfg = prism.TextReceiverConfig()
+        distance_cfg.source = EFFECTIVE_SOURCE_DISTANCE_TOPIC
+        self.sub_distance = app.create_text_receiver(args, connection, distance_cfg)
+        self.sub_distance.on_receive(self._on_source_distance)
+        self.sub_distance.start()
 
-        self.timer = rospy.Timer(rospy.Duration(self.update_period_s), self.on_timer)
+        # -- Command channel (replaces the old ~clear / ~save_csv Trigger services)
+        command_topic = "gegi.{}.command".format(node_name)
+        command_result_topic = "gegi.{}.command_result".format(node_name)
 
-    def _on_source_distance(self, msg):
+        command_recv_cfg = prism.TextReceiverConfig()
+        command_recv_cfg.source = command_topic
+        command_receiver = app.create_text_receiver(args, connection, command_recv_cfg)
+
+        command_result_cfg = prism.TextSenderConfig()
+        command_result_cfg.destination = command_result_topic
+        command_result_sender = app.create_text_sender(args, connection, command_result_cfg)
+
+        self.command_server = CommandServer(command_receiver, command_result_sender)
+        self.command_server.on("clear", self._handle_clear)
+        self.command_server.on("save_csv", self._handle_save_csv)
+        self.command_server.start()
+
+        # -- Periodic update thread (replaces rospy.Timer) ---------------------
+        self._stop_event = threading.Event()
+        self._timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
+        self._timer_thread.start()
+
+    def _throttled_log(self, key, period_s, log_fn, msg, *args):
+        now = time.time()
+        last = self._log_last_time.get(key, 0.0)
+        if now - last >= period_s:
+            self._log_last_time[key] = now
+            log_fn(msg, *args)
+
+    def _timer_loop(self):
+        period = max(self.update_period_s, 0.01)
+        while self._app.is_running() and not self._stop_event.is_set():
+            time.sleep(period)
+            if not self._app.is_running() or self._stop_event.is_set():
+                break
+            try:
+                self.on_timer()
+            except Exception as e:
+                logger.error("on_timer failed: %s", e)
+
+    def stop(self):
+        self._stop_event.set()
+        self._timer_thread.join(timeout=2.0)
+        self.command_server.stop()
+        self.sub.stop()
+        self.sub_activity.stop()
+        self.sub_distance.stop()
+
+    def _on_source_distance(self, message, source=None):
         """Update sphere radius / dose standoff from the plate-derived distance."""
-        d = float(msg.data)
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        d = pmsg.parse_double_value(payload)
+        if d is None:
+            return
+        d = float(d)
         if d > 0 and abs(d - self.radius) > 1e-4:
             with self.lock:
                 self.radius = d
                 self.sphere_points = self.directions * self.radius
-            rospy.loginfo("Sphere heatmap: source distance -> %.3fm", d)
+            logger.info("Sphere heatmap: source distance -> %.3fm", d)
 
-    def _handle_clear(self, req):
+    def _handle_clear(self, params):
         with self.lock:
             n = len(self.events)
             self.events.clear()
-        rospy.loginfo("Cleared %d events from sphere heatmap buffer", n)
-        return TriggerResponse(success=True, message="Cleared {} events".format(n))
+        logger.info("Cleared %d events from sphere heatmap buffer", n)
+        return True, "Cleared {} events".format(n)
 
-    def _on_activity(self, msg):
+    def _on_activity(self, message, source=None):
         """Parse activity results and compute dose rate per isotope."""
         try:
-            data = json.loads(msg.data)
+            data = json.loads(message)
             d = self.radius  # source distance = sphere radius
             dose_rates = {}
             activities = {}
@@ -248,25 +346,31 @@ class SphericalHeatmapNode(object):
         except (ValueError, TypeError):
             pass
 
-    def on_event(self, msg):
-        if msg.cone_angle_uncertainty <= 0.0 or msg.cone_angle_uncertainty > self.max_uncertainty:
+    def on_event(self, message, source=None):
+        try:
+            payload = json.loads(message)
+            evt = pmsg.parse_compton_event(payload)
+        except Exception:
             return
 
-        p1 = np.array([msg.reading_location_1.x, msg.reading_location_1.y, msg.reading_location_1.z], dtype=np.float64)
-        p2 = np.array([msg.reading_location_2.x, msg.reading_location_2.y, msg.reading_location_2.z], dtype=np.float64)
+        if evt['cone_angle_uncertainty'] <= 0.0 or evt['cone_angle_uncertainty'] > self.max_uncertainty:
+            return
+
+        p1 = np.array(evt['reading_location_1'], dtype=np.float64)
+        p2 = np.array(evt['reading_location_2'], dtype=np.float64)
 
         axis = p1 - p2
         n = np.linalg.norm(axis)
         if n < 1e-9:
             return
         axis = axis / n
-        total_energy = msg.energy_kev_1 + msg.energy_kev_2
+        total_energy = evt['energy_kev_1'] + evt['energy_kev_2']
 
         with self.lock:
-            self.events.append((rospy.Time.now(), p1, axis, float(msg.cone_angle), total_energy))
+            self.events.append((pmsg.now_seconds(), p1, axis, float(evt['cone_angle']), total_energy))
 
     def _prune(self, now):
-        cutoff = now - rospy.Duration(self.window_s)
+        cutoff = now - self.window_s
         while self.events and self.events[0][0] < cutoff:
             self.events.popleft()
         if self.max_events > 0 and len(self.events) > self.max_events:
@@ -608,15 +712,16 @@ class SphericalHeatmapNode(object):
         self._peak_history.append(current)
         return confirmed
 
-    def on_timer(self, _event):
-        now = rospy.Time.now()
+    def on_timer(self):
+        now = pmsg.now_seconds()
         with self.lock:
             self._prune(now)
             events = list(self.events)
 
         if len(events) < self.min_events:
-            rospy.loginfo_throttle(10.0, "sphere heatmap waiting: %d/%d events",
-                                   len(events), self.min_events)
+            self._throttled_log("waiting_events", 10.0, logger.info,
+                                 "sphere heatmap waiting: %d/%d events",
+                                 len(events), self.min_events)
             return
 
         scores = self._solve(events)
@@ -631,16 +736,15 @@ class SphericalHeatmapNode(object):
 
         # Publish peak direction (strongest)
         idx_peak = int(np.argmax(scores))
-        peak_dir = self.directions[idx_peak]
 
-        peak_msg = PoseStamped()
-        peak_msg.header.stamp = now
-        peak_msg.header.frame_id = "detector"
-        peak_msg.pose.position.x = float(self.sphere_points[idx_peak, 0])
-        peak_msg.pose.position.y = float(self.sphere_points[idx_peak, 1])
-        peak_msg.pose.position.z = float(self.sphere_points[idx_peak, 2])
-        peak_msg.pose.orientation.w = 1.0
-        self.pub_peak.publish(peak_msg)
+        direction_msg = {
+            "stamp": now,
+            "frame_id": "detector",
+            "x": float(self.sphere_points[idx_peak, 0]),
+            "y": float(self.sphere_points[idx_peak, 1]),
+            "z": float(self.sphere_points[idx_peak, 2]),
+        }
+        self.pub_direction.send(json.dumps(direction_msg))
 
         # Find peaks per isotope energy band. Collect raw candidates first, then
         # apply temporal persistence to drop flickering ghost peaks before publish.
@@ -687,33 +791,34 @@ class SphericalHeatmapNode(object):
 
         confirmed_peaks = self._apply_peak_persistence(raw_candidates)
 
-        peaks_msg = PoseArray()
-        peaks_msg.header.stamp = now
-        peaks_msg.header.frame_id = "detector"
         isotope_labels = []
+        points_msg = []
         for c in confirmed_peaks:
-            p = Pose()
-            p.position.x = self.radius  # source distance along X
-            p.position.y = c['y']
-            p.position.z = c['z']
-            p.orientation.w = 1.0
-            peaks_msg.poses.append(p)
+            points_msg.append({
+                "x": self.radius,  # source distance along X
+                "y": c['y'],
+                "z": c['z'],
+                "isotope": c['iso'],
+                "count": c['count'],
+            })
             isotope_labels.append("{}:{}".format(c['iso'], c['count']))
 
-        self.pub_peaks.publish(peaks_msg)
+        directions_msg = {
+            "stamp": now,
+            "frame_id": "detector",
+            "points": points_msg,
+        }
+        self.pub_directions.send(json.dumps(directions_msg))
 
         # Store peaks for CSV export (Y,Z in sphere coordinates + isotope name)
-        self._last_peaks = []
-        for pose in peaks_msg.poses:
-            self._last_peaks.append((pose.position.y, pose.position.z))
+        self._last_peaks = [(p['y'], p['z']) for p in points_msg]
         self._last_isotope_labels = isotope_labels
 
         # Publish isotope identification with counts
-        iso_msg = String()
-        iso_msg.data = "|".join(isotope_labels) if isotope_labels else "none"
-        self.pub_isotopes.publish(iso_msg)
+        iso_text = "|".join(isotope_labels) if isotope_labels else "none"
+        self.pub_isotopes.send(iso_text)
 
-        # Publish PointCloud2 with per-isotope scores scaled to dose rate (uSv/h)
+        # Publish point cloud with per-isotope scores scaled to dose rate (uSv/h)
         with self.lock:
             dose_rates = dict(self._dose_rate_uSv_h)
 
@@ -746,7 +851,7 @@ class SphericalHeatmapNode(object):
             combined = np.maximum(combined, v)
         norm_scores = combined
 
-        # Store for CSV export (service call or auto-save)
+        # Store for CSV export (command call or auto-save)
         self._last_iso_scores = iso_norm_scores
         self._last_combined = combined
 
@@ -757,21 +862,21 @@ class SphericalHeatmapNode(object):
             try:
                 self._save_csv(iso_norm_scores, combined)
             except Exception as e:
-                rospy.logerr_throttle(10.0, "CSV save failed: %s", e)
+                self._throttled_log("csv_save_failed", 10.0, logger.error,
+                                     "CSV save failed: %s", e)
 
-        rospy.loginfo_throttle(5.0,
-                               "sphere heatmap: %d events, %d sources [%s], peak dose=%.3f uSv/h, dose_rates=%s",
-                               len(events), len(peaks_msg.poses),
-                               iso_msg.data,
-                               float(norm_scores.max()),
-                               dose_rates)
+        self._throttled_log(
+            "status", 5.0, logger.info,
+            "sphere heatmap: %d events, %d sources [%s], peak dose=%.3f uSv/h, dose_rates=%s",
+            len(events), len(points_msg), iso_text,
+            float(norm_scores.max()), dose_rates)
 
-    def _handle_save_csv(self, req):
-        """Service handler to trigger a one-shot CSV save."""
+    def _handle_save_csv(self, params):
+        """Command handler to trigger a one-shot CSV save."""
         if hasattr(self, '_last_iso_scores') and hasattr(self, '_last_combined'):
             self._save_csv(self._last_iso_scores, self._last_combined)
-            return TriggerResponse(success=True, message="CSV saved to " + self.csv_output_dir)
-        return TriggerResponse(success=False, message="No heatmap data available yet")
+            return True, "CSV saved to " + self.csv_output_dir
+        return False, "No heatmap data available yet"
 
     def _save_csv(self, iso_norm_scores, combined_scores):
         """Save both raw and rasterised CSV files."""
@@ -902,8 +1007,8 @@ class SphericalHeatmapNode(object):
                         grid_combined[zi, yi]))
 
     def _publish_cloud(self, stamp, norm_scores, iso_norm_scores):
-        """Publish colored PointCloud2 with per-isotope intensity fields.
-        
+        """Publish colored point-cloud binary blob + JSON metadata header.
+
         The intensity field contains dose rate in uSv/h.
         RGB is normalized for visual coloring only.
         """
@@ -911,16 +1016,6 @@ class SphericalHeatmapNode(object):
         n = points.shape[0]
 
         # Fields: x, y, z, rgb, intensity, cs137, co60  (7 floats = 28 bytes)
-        fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
-            PointField(name='intensity', offset=16, datatype=PointField.FLOAT32, count=1),
-            PointField(name='cs137', offset=20, datatype=PointField.FLOAT32, count=1),
-            PointField(name='co60', offset=24, datatype=PointField.FLOAT32, count=1),
-        ]
-
         point_step = 28
         cs137_scores = iso_norm_scores.get('Cs-137', np.zeros(n))
         co60_scores = iso_norm_scores.get('Co-60', np.zeros(n))
@@ -951,20 +1046,77 @@ class SphericalHeatmapNode(object):
             struct.pack_into('f', buf, i * point_step + 20, cs137_scores[i] if color_scores[i] > 0 else 0.0)
             struct.pack_into('f', buf, i * point_step + 24, co60_scores[i] if color_scores[i] > 0 else 0.0)
 
-        msg = PointCloud2()
-        msg.header = Header(stamp=stamp, frame_id="detector")
-        msg.height = 1
-        msg.width = n
-        msg.fields = fields
-        msg.is_bigendian = False
-        msg.point_step = point_step
-        msg.row_step = n * point_step
-        msg.data = bytes(buf)
-        msg.is_dense = True
-        self.pub_cloud.publish(msg)
+        meta = {
+            "stamp": stamp,
+            "frame_id": "detector",
+            "point_step": point_step,
+            "n_points": n,
+            "fields": ["x", "y", "z", "rgb", "intensity", "cs137", "co60"],
+        }
+        self.pub_cloud_meta.send(json.dumps(meta))
+        self.pub_cloud.send(bytes(buf))
+
+
+def main():
+    app = prism.Application("spherical_heatmap_node",
+                             "GeGi spherical Compton back-projection heatmap", sys.argv)
+
+    app.add_string_option("Heatmap", "isotopes-config", "Path to isotopes.yaml configuration", "")
+    app.add_float_option("Heatmap", "radius", "Sphere radius in metres", 0.5)
+    app.add_int_option("Heatmap", "n-points", "Number of points on the sphere grid", 8000)
+    app.add_float_option("Heatmap", "window-s", "Rolling event window in seconds", 180.0)
+    app.add_float_option("Heatmap", "update-period-s", "Heatmap update period in seconds", 2.0)
+    app.add_int_option("Heatmap", "min-events", "Minimum events before publishing", 50)
+    app.add_int_option("Heatmap", "max-events", "Cap on events fed to back-projection", 20000)
+    app.add_float_option("Heatmap", "sigma-floor", "Angular Gaussian sigma (radians)", 0.04)
+    app.add_float_option("Heatmap", "max-uncertainty", "Max accepted cone angle uncertainty", 0.15)
+    app.add_bool_option("Heatmap", "no-hemisphere-only",
+                         "Disable +X-hemisphere-only restriction (default: hemisphere only)")
+    app.add_int_option("Heatmap", "max-peaks", "Maximum peaks to report per isotope", 5)
+    app.add_float_option("Heatmap", "peak-min-separation-deg",
+                         "Minimum angular separation between peaks (degrees)", 25.0)
+    app.add_float_option("Heatmap", "peak-threshold",
+                         "Secondary peak threshold as fraction of primary", 0.5)
+    app.add_bool_option("Heatmap", "no-refine-peaks",
+                         "Disable score-weighted centroid peak refinement (default: enabled)")
+    app.add_int_option("Heatmap", "peak-persist-frames", "Frames considered for peak persistence", 4)
+    app.add_int_option("Heatmap", "peak-persist-min", "Minimum confirming frames for a peak", 2)
+    app.add_float_option("Heatmap", "peak-persist-tol-deg",
+                         "Angular tolerance for peak persistence matching (degrees)", 8.0)
+    app.add_float_option("Heatmap", "support-ratio",
+                         "Ghost rejection: min support as fraction of strongest peak", 0.5)
+    app.add_int_option("Heatmap", "min-source-events", "Minimum event support for a real source", 15)
+    app.add_float_option("Heatmap", "attribution-tol-deg",
+                         "Angular tolerance for event-to-peak attribution (degrees)", 6.0)
+    app.add_bool_option("Heatmap", "iterative-extraction",
+                         "Use CLEAN-style iterative peak extraction instead of support filtering")
+    app.add_string_option("Heatmap", "csv-output-dir", "Directory for auto-saved CSV files",
+                          "/opt/phds_gegi_driver/data")
+    app.add_bool_option("Heatmap", "csv-enabled", "Auto-save CSV files on every update cycle")
+    app.add_float_option("Heatmap", "raster-cell-m", "Rasterised CSV cell size in metres", 0.005)
+    app.add_float_option("Heatmap", "raster-fov-m", "Rasterised CSV field of view in metres", 0.5)
+    app.add_string_option("Heatmap", "node-name",
+                          "Used to build gegi.<node-name>.command(_result) topic names",
+                          "spherical_heatmap")
+
+    result = app.parse()
+    if result is None:
+        sys.exit(1)
+    app.init_logger(result)
+
+    connection = app.create_connection(result)
+    if connection is None:
+        logger.error("Could not connect to messaging backend - is the server running?")
+        sys.exit(1)
+
+    node = SphericalHeatmapNode(app, result, connection)
+
+    while app.is_running():
+        time.sleep(0.1)
+
+    node.stop()
+    connection.close()
 
 
 if __name__ == "__main__":
-    rospy.init_node("spherical_heatmap")
-    node = SphericalHeatmapNode()
-    rospy.spin()
+    main()

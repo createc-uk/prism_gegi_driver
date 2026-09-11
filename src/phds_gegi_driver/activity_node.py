@@ -3,9 +3,9 @@
 Activity Node - Computes net peak area and activity (Bq) per isotope from
 accumulated spectra.
 
-Subscribes to /spectrum (radiation_detector_msgs/Spectrum) published by the
-spectrum node, accumulates counts over a configurable counting window, then
-computes per-isotope net peak areas using linear sideband background
+Subscribes to a Spectrum topic (default: gegi.spectrum.histogram) published by
+the spectrum node, accumulates counts over a configurable counting window,
+then computes per-isotope net peak areas using linear sideband background
 subtraction, applies dead-time correction, and derives activity.
 
 Physics:
@@ -15,35 +15,66 @@ Physics:
   Or equivalently: Activity = N_net_corrected * calibration_factor
 
 Published Topics:
-  ~/total_activity (std_msgs/Float64): Sum of all isotope activities in MBq.
-  ~/results (std_msgs/String): JSON with per-isotope breakdown (MBq).
+  gegi.activity.total_activity (DoubleValue): Sum of all isotope activities in MBq.
+  gegi.activity.results (raw JSON string): Per-isotope breakdown (MBq).
+  gegi.activity.effective_source_distance (DoubleValue): Effective source
+      distance in metres (base standoff + shielding plates).
 
-Parameters:
-  ~isotopes_config (str): Path to isotopes.yaml configuration.
-  ~calibration_file (str): Path to EnergyCal.csv (energy bin edges in keV).
-  ~counting_window_s (float): Override counting window (default from config).
-  ~spectrum_topic (str): Input topic (default: /spectrum).
-  ~publish_on_window (bool): Publish only when window completes (default: true).
-  ~source_distance_m (float): Source-detector distance in metres. When > 0,
-      computes solid angle for absolute activity. Updated dynamically via
-      ~/source_distance topic (std_msgs/Float64, in metres).
-  ~calibration_distance_m (float): Distance at which empirical calibration
+CLI options (defaults mirror the old ROS ~params of the same purpose):
+  --isotopes-config (str): Path to isotopes.yaml configuration.
+  --calibration-file (str): Path to EnergyCal.csv (energy bin edges in keV).
+  --spectrum-topic (str): Input topic (default: gegi.spectrum.histogram).
+  --no-publish-on-window (bool): Disable publish-only-on-window-completion
+      behaviour (rare). Original ROS default was true (publish on window);
+      omitting this flag reproduces that default.
+  --counting-window-s (float): Override counting window (0 = use value from
+      isotopes.yaml, default from config).
+  --source-distance-m (float): Source-detector distance in metres. When > 0,
+      computes solid angle for absolute activity. Updated dynamically via the
+      gegi.activity.source_distance topic (DoubleValue, in metres).
+  --calibration-distance-m (float): Distance at which empirical calibration
       factors were measured (default: 0.5 m). Only used if calibration_factor
       fallback is active.
+  --crystal-radius-m (float): Detector crystal radius override (0 = use config).
+  --n-shielding-plates (int): Number of in-line shielding plates.
+  --node-name (str): Used only to build the command-channel topic names
+      gegi.<node-name>.command / gegi.<node-name>.command_result
+      (default: activity)
 """
-from __future__ import print_function
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import json
 import math
-import os
 import threading
+import time
 
 import numpy as np
-import rospy
+import prism
 import yaml
-from std_msgs.msg import Float64, Int32, String
-from std_srvs.srv import Trigger, TriggerResponse
-from radiation_detector_msgs.msg import Spectrum
+
+import prism_messages as pmsg
+from prism_command_channel import CommandServer
+
+import logging
+
+logging.basicConfig(level=logging.INFO,
+                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("activity_node")
+
+# Fixed topic names (not CLI-overridable; see prism_messages.py for schemas).
+TOTAL_ACTIVITY_TOPIC = "gegi.activity.total_activity"
+RESULTS_TOPIC = "gegi.activity.results"
+EFFECTIVE_SOURCE_DISTANCE_TOPIC = "gegi.activity.effective_source_distance"
+SOURCE_DISTANCE_TOPIC = "gegi.activity.source_distance"
+N_SHIELDING_PLATES_TOPIC = "gegi.activity.n_shielding_plates"
+
+# Republish the effective source distance at this interval so late-joining
+# subscribers converge quickly. ROS latched topics had no wait-for-subscriber
+# delay; Prism topics have no latching equivalent, so this timer replaces it.
+DISTANCE_REPUBLISH_PERIOD_S = 5.0
 
 
 # PHDS GeGI Intrinsic Detection Efficiency polynomial coefficients.
@@ -153,44 +184,51 @@ class IsotopeConfig(object):
 
 
 class ActivityNode(object):
-    def __init__(self):
-        # Load isotope configuration
-        config_path = rospy.get_param("~isotopes_config", "")
-        cal_path = rospy.get_param("~calibration_file", "")
-        spectrum_topic = rospy.get_param("~spectrum_topic", "/spectrum")
-        self.publish_on_window = rospy.get_param("~publish_on_window", True)
+    def __init__(self, app, args, connection):
+        self._app = app
 
-        # Source distance in metres. Dynamically updatable via ~/source_distance topic.
+        # Load isotope configuration
+        config_path = args.get_string("isotopes-config")
+        cal_path = args.get_string("calibration-file")
+        spectrum_topic = args.get_string("spectrum-topic")
+        self.publish_on_window = not args.get_bool("no-publish-on-window")
+
+        # Source distance in metres. Dynamically updatable via the
+        # gegi.activity.source_distance topic.
         # When > 0, the node uses first-principles (intrinsic efficiency + solid angle)
         # for geometry-independent activity measurement.
-        self.source_distance_m = rospy.get_param("~source_distance_m", 0.0)
-        self.calibration_distance_m = rospy.get_param("~calibration_distance_m", 0.5)
-        # Detector crystal radius (loaded from config below; param overrides).
-        self.crystal_radius_m = rospy.get_param("~crystal_radius_m", 0.0)
+        self.source_distance_m = args.get_float("source-distance-m")
+        self.calibration_distance_m = args.get_float("calibration-distance-m")
+        # Detector crystal radius (loaded from config below; option overrides).
+        self.crystal_radius_m = args.get_float("crystal-radius-m")
 
         # In-line shielding: operator sets the number of identical plates; the
         # driver derives the standoff and the per-line attenuation from it.
-        self.n_shielding_plates = int(rospy.get_param("~n_shielding_plates", 0))
+        self.n_shielding_plates = int(args.get_int("n-shielding-plates"))
         self.plate_thickness_m = 0.0
         self.base_standoff_m = 0.0
+
+        node_name = args.get_string("node-name")
+        counting_window_override_s = args.get_float("counting-window-s")
 
         # Load energy calibration
         self.bin_edges = self._load_energy_cal(cal_path)
         n_bins = len(self.bin_edges)
-        rospy.loginfo("Activity node: %d energy bins loaded", n_bins)
+        logger.info("Activity node: %d energy bins loaded", n_bins)
 
         # Load isotope config
         iso_cfg = self._load_isotope_config(config_path)
-        self.counting_window_s = rospy.get_param(
-            "~counting_window_s", iso_cfg.get('counting_window_s', 60.0))
+        self.counting_window_s = (
+            counting_window_override_s if counting_window_override_s > 0
+            else iso_cfg.get('counting_window_s', 60.0))
         self.min_net_counts = iso_cfg.get('min_net_counts', 400)
 
-        # Crystal radius from config if not overridden by param.
+        # Crystal radius from config if not overridden by option.
         if self.crystal_radius_m <= 0:
             self.crystal_radius_m = iso_cfg.get('crystal_radius_m', GEGI_CRYSTAL_RADIUS_M) \
                 or GEGI_CRYSTAL_RADIUS_M
 
-        # Allow source_distance_m from config file if not set via param
+        # Allow source_distance_m from config file if not set via option
         if self.source_distance_m <= 0:
             self.source_distance_m = iso_cfg.get('source_distance_m', 0.0) or 0.0
         if self.calibration_distance_m <= 0:
@@ -223,53 +261,92 @@ class ActivityNode(object):
                 ic = IsotopeConfig(name, cfg, self.bin_edges,
                                    self.calibration_distance_m, self.crystal_radius_m)
                 self.isotopes.append(ic)
-                rospy.loginfo("  Isotope %s: peak channels %d-%d, E=%.1f keV, "
-                              "eps_intrinsic=%.6f",
-                              name, ic.peak_channels[0], ic.peak_channels[-1],
-                              ic.energy_keV, ic.intrinsic_efficiency)
+                logger.info("  Isotope %s: peak channels %d-%d, E=%.1f keV, "
+                            "eps_intrinsic=%.6f",
+                            name, ic.peak_channels[0], ic.peak_channels[-1],
+                            ic.energy_keV, ic.intrinsic_efficiency)
             except Exception as e:
-                rospy.logwarn("Failed to configure isotope %s: %s", name, str(e))
+                logger.warning("Failed to configure isotope %s: %s", name, str(e))
 
         # Accumulation state
         self.lock = threading.Lock()
         self.accumulated_spectrum = np.zeros(n_bins, dtype=np.float64)
         self.accumulated_real_time_ms = 0
         self.accumulated_dead_time_ms = 0
-        self.window_start_time = rospy.Time.now()
+        self.window_start_time = pmsg.now_seconds()
+        self._warn_last_time = {}
 
-        # Publishers
-        self.pub_total = rospy.Publisher("~total_activity", Float64, queue_size=2)
-        self.pub_results = rospy.Publisher("~results", String, queue_size=2)
-        # Effective source distance (base_standoff + n_plates * thickness), latched
-        # so dose/imaging nodes (data_recorder, spherical_heatmap) track shielding.
-        self.pub_distance = rospy.Publisher("~effective_source_distance", Float64,
-                                            queue_size=1, latch=True)
+        # -- Senders ------------------------------------------------------
+        total_cfg = prism.TextSenderConfig()
+        total_cfg.destination = TOTAL_ACTIVITY_TOPIC
+        self.pub_total = app.create_text_sender(args, connection, total_cfg)
 
-        # Services
-        self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
+        results_cfg = prism.TextSenderConfig()
+        results_cfg.destination = RESULTS_TOPIC
+        self.pub_results = app.create_text_sender(args, connection, results_cfg)
 
-        # Subscribers
-        self.sub = rospy.Subscriber(spectrum_topic, Spectrum,
-                                    self._on_spectrum, queue_size=10)
+        # Effective source distance (base_standoff + n_plates * thickness). ROS
+        # latching has no Prism equivalent; a periodic republish timer (below)
+        # takes its place so dose/imaging nodes (data_recorder,
+        # spherical_heatmap) still converge quickly on late subscription.
+        distance_cfg = prism.TextSenderConfig()
+        distance_cfg.destination = EFFECTIVE_SOURCE_DISTANCE_TOPIC
+        self.pub_distance = app.create_text_sender(args, connection, distance_cfg)
+
+        # -- Command channel (replaces the old ~clear Trigger service) ------
+        command_topic = "gegi.{}.command".format(node_name)
+        command_result_topic = "gegi.{}.command_result".format(node_name)
+
+        command_recv_cfg = prism.TextReceiverConfig()
+        command_recv_cfg.source = command_topic
+        command_receiver = app.create_text_receiver(args, connection, command_recv_cfg)
+
+        command_result_cfg = prism.TextSenderConfig()
+        command_result_cfg.destination = command_result_topic
+        command_result_sender = app.create_text_sender(args, connection, command_result_cfg)
+
+        self.command_server = CommandServer(command_receiver, command_result_sender)
+        self.command_server.on("clear", self._handle_clear)
+        self.command_server.start()
+
+        # -- Subscribers ----------------------------------------------------
+        spectrum_recv_cfg = prism.TextReceiverConfig()
+        spectrum_recv_cfg.source = spectrum_topic
+        self.sub = app.create_text_receiver(args, connection, spectrum_recv_cfg)
+        self.sub.on_receive(self._on_spectrum)
+        self.sub.start()
+
         # Dynamic distance input - allows real-time distance updates from
         # range sensor, operator input, or localisation system.
-        self.sub_distance = rospy.Subscriber("~source_distance", Float64,
-                                             self._on_distance, queue_size=2)
+        distance_recv_cfg = prism.TextReceiverConfig()
+        distance_recv_cfg.source = SOURCE_DISTANCE_TOPIC
+        self.sub_distance = app.create_text_receiver(args, connection, distance_recv_cfg)
+        self.sub_distance.on_receive(self._on_distance)
+        self.sub_distance.start()
+
         # Operator sets the number of in-line shielding plates for hot trays;
         # the driver re-derives the standoff and attenuation from it.
-        self.sub_plates = rospy.Subscriber("~n_shielding_plates", Int32,
-                                           self._on_n_plates, queue_size=2)
+        plates_recv_cfg = prism.TextReceiverConfig()
+        plates_recv_cfg.source = N_SHIELDING_PLATES_TOPIC
+        self.sub_plates = app.create_text_receiver(args, connection, plates_recv_cfg)
+        self.sub_plates.on_receive(self._on_n_plates)
+        self.sub_plates.start()
 
-        rospy.loginfo("Activity node ready. Window=%.1fs, %d isotopes configured. "
-                      "distance=%.3fm, solid_angle=%.6f, shielding_plates=%d",
-                      self.counting_window_s, len(self.isotopes),
-                      self.source_distance_m, self.solid_angle_fraction,
-                      self.n_shielding_plates)
+        logger.info("Activity node ready. Window=%.1fs, %d isotopes configured. "
+                    "distance=%.3fm, solid_angle=%.6f, shielding_plates=%d",
+                    self.counting_window_s, len(self.isotopes),
+                    self.source_distance_m, self.solid_angle_fraction,
+                    self.n_shielding_plates)
         self._publish_distance()
+
+        # -- Periodic distance republish thread (replaces ROS topic latching) --
+        self._stop_event = threading.Event()
+        self._distance_thread = threading.Thread(target=self._distance_republish_loop, daemon=True)
+        self._distance_thread.start()
 
     def _load_energy_cal(self, path):
         if not path or not os.path.exists(path):
-            rospy.logwarn("No calibration file for activity node, using default 1024 bins")
+            logger.warning("No calibration file for activity node, using default 1024 bins")
             return np.linspace(0.0, 3000.0, 1024)
         values = []
         with open(path, 'r') as f:
@@ -281,7 +358,7 @@ class ActivityNode(object):
 
     def _load_isotope_config(self, path):
         if not path or not os.path.exists(path):
-            rospy.logwarn("No isotopes config file specified, using defaults")
+            logger.warning("No isotopes config file specified, using defaults")
             return {'counting_window_s': 60.0, 'min_net_counts': 400, 'isotopes': {}}
         with open(path, 'r') as f:
             return yaml.safe_load(f)
@@ -314,51 +391,76 @@ class ActivityNode(object):
     def _publish_distance(self):
         """Broadcast the effective source distance to dose/imaging consumers."""
         try:
-            self.pub_distance.publish(Float64(data=self.source_distance_m))
+            payload = pmsg.make_double_value(self.source_distance_m)
+            self.pub_distance.send(json.dumps(payload))
         except Exception:
             pass
+
+    def _distance_republish_loop(self):
+        """Periodically republish the current effective source distance so
+        late-joining subscribers converge quickly (no latching in Prism)."""
+        while self._app.is_running() and not self._stop_event.is_set():
+            time.sleep(DISTANCE_REPUBLISH_PERIOD_S)
+            if not self._app.is_running() or self._stop_event.is_set():
+                break
+            self._publish_distance()
 
     def _shield_transmission(self, iso):
         """Fraction of this isotope's gammas transmitted through the plates."""
         return shield_transmission(
             iso.mu_shield_per_m, self._total_plates(), self.plate_thickness_m)
 
-    def _on_distance(self, msg):
-        """Callback for dynamic distance updates (std_msgs/Float64, metres)."""
-        new_dist = msg.data
+    def _on_distance(self, message, source=None):
+        """Callback for dynamic distance updates (DoubleValue, metres)."""
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        new_dist = pmsg.parse_double_value(payload)
+        if new_dist is None:
+            return
         if new_dist > 0 and abs(new_dist - self.source_distance_m) > 0.001:
             self.source_distance_m = new_dist
             self._update_solid_angle()
             self._publish_distance()
-            rospy.loginfo("Activity node: distance updated to %.3fm -> solid_angle=%.6f",
-                          self.source_distance_m, self.solid_angle_fraction)
+            logger.info("Activity node: distance updated to %.3fm -> solid_angle=%.6f",
+                        self.source_distance_m, self.solid_angle_fraction)
 
-    def _on_n_plates(self, msg):
+    def _on_n_plates(self, message, source=None):
         """Callback: operator sets the number of in-line shielding plates."""
-        n = int(msg.data)
-        if n < 0:
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        n = pmsg.parse_int_value(payload)
+        if n is None or n < 0:
             return
         if n != self.n_shielding_plates:
             self.n_shielding_plates = n
             self._recompute_distance_from_plates()
             self._update_solid_angle()
             self._publish_distance()
-            rospy.loginfo("Activity node: %d shielding plate(s) -> distance=%.3fm, "
-                          "solid_angle=%.6f", self.n_shielding_plates,
-                          self.source_distance_m, self.solid_angle_fraction)
+            logger.info("Activity node: %d shielding plate(s) -> distance=%.3fm, "
+                        "solid_angle=%.6f", self.n_shielding_plates,
+                        self.source_distance_m, self.solid_angle_fraction)
 
-    def _on_spectrum(self, msg):
+    def _on_spectrum(self, message, source=None):
         """Accumulate incoming spectrum snapshots into the counting window."""
-        spectrum_arr = np.array(msg.spectrum, dtype=np.float64)
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        spectrum_msg = pmsg.parse_spectrum(payload)
+        spectrum_arr = np.array(spectrum_msg['spectrum'], dtype=np.float64)
 
         with self.lock:
             n = min(len(spectrum_arr), len(self.accumulated_spectrum))
             self.accumulated_spectrum[:n] += spectrum_arr[:n]
-            self.accumulated_real_time_ms += msg.realTime_ms
-            self.accumulated_dead_time_ms += msg.deadTime_ms
+            self.accumulated_real_time_ms += spectrum_msg['real_time_ms']
+            self.accumulated_dead_time_ms += spectrum_msg['dead_time_ms']
 
         # Check if counting window has elapsed
-        elapsed = (rospy.Time.now() - self.window_start_time).to_sec()
+        elapsed = pmsg.now_seconds() - self.window_start_time
         if elapsed >= self.counting_window_s:
             self._compute_and_publish()
 
@@ -372,13 +474,13 @@ class ActivityNode(object):
             self.accumulated_spectrum[:] = 0
             self.accumulated_real_time_ms = 0
             self.accumulated_dead_time_ms = 0
-            self.window_start_time = rospy.Time.now()
+            self.window_start_time = pmsg.now_seconds()
 
         # Live time in seconds
         real_time_s = real_time_ms / 1000.0
         live_time_s = (real_time_ms - dead_time_ms) / 1000.0
         if live_time_s <= 0:
-            rospy.logwarn("Activity node: live time <= 0, skipping computation")
+            logger.warning("Activity node: live time <= 0, skipping computation")
             return
 
         # Dead-time correction factor
@@ -440,7 +542,7 @@ class ActivityNode(object):
         total_activity_MBq = total_activity_Bq / 1.0e6
 
         # Publish total in MBq
-        self.pub_total.publish(Float64(data=total_activity_MBq))
+        self.pub_total.send(json.dumps(pmsg.make_double_value(total_activity_MBq)))
 
         # Publish detailed JSON results (all activities in MBq)
         results_MBq = []
@@ -451,7 +553,7 @@ class ActivityNode(object):
             results_MBq.append(r_copy)
 
         report = {
-            'timestamp': rospy.Time.now().to_sec(),
+            'timestamp': pmsg.now_seconds(),
             'real_time_s': real_time_s,
             'live_time_s': live_time_s,
             'dead_time_fraction': dead_time_ms / float(real_time_ms) if real_time_ms > 0 else 0.0,
@@ -462,11 +564,21 @@ class ActivityNode(object):
             'total_activity_MBq': total_activity_MBq,
             'isotopes': results_MBq
         }
-        self.pub_results.publish(String(data=json.dumps(report, indent=2)))
+        # Payload is already hand-rolled JSON text (no dataType wrapper), sent
+        # directly -- keep byte-for-byte identical construction to the old
+        # std_msgs/String payload.
+        self.pub_results.send(json.dumps(report, indent=2))
 
-        rospy.loginfo("Activity: total=%.4f MBq (%.1fs window, DT=%.3f%%)",
-                      total_activity_MBq, real_time_s,
-                      100.0 * dead_time_ms / max(real_time_ms, 1))
+        logger.info("Activity: total=%.4f MBq (%.1fs window, DT=%.3f%%)",
+                    total_activity_MBq, real_time_s,
+                    100.0 * dead_time_ms / max(real_time_ms, 1))
+
+    def _throttled_warn(self, key, period_s, msg, *fmt_args):
+        now = time.time()
+        last = self._warn_last_time.get(key, 0.0)
+        if now - last >= period_s:
+            self._warn_last_time[key] = now
+            logger.warning(msg, *fmt_args)
 
     def _compute_isotope_activity(self, iso, spectrum, live_time_s, dt_correction):
         """
@@ -546,7 +658,8 @@ class ActivityNode(object):
                 method_used = 'manual_efficiency'
             else:
                 activity_Bq = 0.0
-                rospy.logwarn_throttle(30,
+                self._throttled_warn(
+                    'no_efficiency_' + iso.name, 30,
                     "Isotope %s: cannot compute activity. Set source_distance_m "
                     "or provide calibration_factor for efficiency derivation.",
                     iso.name)
@@ -579,20 +692,61 @@ class ActivityNode(object):
             'below_min_counts': not valid and net_peak_area > 0
         }
 
-    def _handle_clear(self, req):
+    def _handle_clear(self, params):
         with self.lock:
             self.accumulated_spectrum[:] = 0
             self.accumulated_real_time_ms = 0
             self.accumulated_dead_time_ms = 0
-            self.window_start_time = rospy.Time.now()
-        rospy.loginfo("Activity node accumulator cleared")
-        return TriggerResponse(success=True, message="Activity accumulator cleared")
+            self.window_start_time = pmsg.now_seconds()
+        logger.info("Activity node accumulator cleared")
+        return True, "Activity accumulator cleared"
+
+    def stop(self):
+        self._stop_event.set()
+        self._distance_thread.join(timeout=2.0)
+        self.command_server.stop()
+        self.sub.stop()
+        self.sub_distance.stop()
+        self.sub_plates.stop()
 
 
 def main():
-    rospy.init_node("activity_node")
-    node = ActivityNode()
-    rospy.spin()
+    app = prism.Application("activity_node", "GeGi per-isotope activity estimator", sys.argv)
+
+    app.add_string_option("Activity", "isotopes-config", "Path to isotopes.yaml configuration", "")
+    app.add_string_option("Activity", "calibration-file", "Path to EnergyCal.csv (energy bin edges in keV)", "")
+    app.add_string_option("Activity", "spectrum-topic", "Input spectrum topic", "gegi.spectrum.histogram")
+    app.add_bool_option("Activity", "no-publish-on-window",
+                         "Disable publish-only-on-window-completion behaviour (rare)")
+    app.add_float_option("Activity", "counting-window-s",
+                          "Override counting window in seconds (0 = use isotopes.yaml value)", 0.0)
+    app.add_float_option("Activity", "source-distance-m",
+                          "Source-detector distance in metres (0 = use isotopes.yaml value)", 0.0)
+    app.add_float_option("Activity", "calibration-distance-m",
+                          "Distance at which empirical calibration factors were measured", 0.5)
+    app.add_float_option("Activity", "crystal-radius-m",
+                          "Detector crystal radius override (0 = use isotopes.yaml value)", 0.0)
+    app.add_int_option("Activity", "n-shielding-plates", "Number of in-line shielding plates", 0)
+    app.add_string_option("Activity", "node-name",
+                           "Used to build gegi.<node-name>.command(_result) topic names", "activity")
+
+    result = app.parse()
+    if result is None:
+        sys.exit(1)
+    app.init_logger(result)
+
+    connection = app.create_connection(result)
+    if connection is None:
+        logger.error("Could not connect to messaging backend - is the server running?")
+        sys.exit(1)
+
+    node = ActivityNode(app, result, connection)
+
+    while app.is_running():
+        time.sleep(0.1)
+
+    node.stop()
+    connection.close()
 
 
 if __name__ == "__main__":

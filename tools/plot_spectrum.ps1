@@ -1,26 +1,32 @@
 param(
     [switch]$Cumulative,
-    [string]$RosHost = "localhost",
-    [int]$RosPort = 9090
+    [string]$NatsHost = "localhost",
+    [int]$NatsPort = 4222,
+    [string]$Protocol = "nats",
+    [string]$PythonCommand = "python"
 )
-# Launch the live spectrum plotter natively on Windows via rosbridge.
-# Requires:
-#   - gegi_full_pipeline.launch running (WSL distro 'ros-melodic': ~/gegi_ws/run.sh),
-#     which starts rosbridge_server on port 9090
-#   - pip install roslibpy matplotlib numpy   (in the Windows Python env)
+# Launch the Prism-native live spectrum plotter on Windows.
+# Requires the Prism Python bindings, matplotlib, and numpy in the selected
+# Python environment. The NATS server must be reachable at NatsHost:NatsPort.
 #
 # Usage:
-#   .\plot_spectrum.ps1                       # Show latest snapshot each update
-#   .\plot_spectrum.ps1 -Cumulative           # Accumulate counts over time
-#   .\plot_spectrum.ps1 -RosHost <wsl-ip>     # If localhost forwarding fails, use `wsl hostname -I`
+#   .\plot_spectrum.ps1
+#   .\plot_spectrum.ps1 -Cumulative
+#   .\plot_spectrum.ps1 -NatsHost <server-ip> -NatsPort 4222
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonScript = Join-Path $scriptDir "plot_live_spectrum.py"
 
-$args_ = @($pythonScript, "--host", $RosHost, "--port", $RosPort)
+$arguments = @(
+    $pythonScript,
+    "--protocol", $Protocol,
+    "--server", $NatsHost,
+    "--port", $NatsPort
+)
 if ($Cumulative) {
-    $args_ += "--cumulative"
+    $arguments += "--cumulative"
 }
 
-& python @args_
+& $PythonCommand @arguments
+exit $LASTEXITCODE

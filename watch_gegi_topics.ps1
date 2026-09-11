@@ -1,39 +1,63 @@
+[CmdletBinding()]
 param(
+    [ValidateSet("Auto", "Host", "Container")]
+    [string]$ExecutionTarget = "Auto",
+
     [string]$ContainerName = "",
     [string]$ImageHint = "phds_gegi_driver",
+    [string]$PrismCommand = "prism",
+    [string]$NatsHost = "localhost",
+
+    [ValidateRange(1, 65535)]
+    [int]$NatsPort = 4222,
+
     [ValidateSet("echo", "hz")]
     [string]$Mode = "echo",
-    [int]$SampleCount = 0
+
+    [ValidateRange(0, [int]::MaxValue)]
+    [int]$SampleCount = 0,
+
+    [Nullable[int]]$WindowSeconds = $null,
+
+    [ValidateRange(1, 86400)]
+    [int]$DurationSeconds = 30,
+
+    [string[]]$Topics = @(
+        "gegi.driver.compton_event",
+        "gegi.driver.energy_deposit",
+        "gegi.detector.run_info",
+        "gegi.detector.detector_info",
+        "gegi.spectrum.histogram",
+        "gegi.heatmap.cloud_meta",
+        "gegi.heatmap.source_direction",
+        "gegi.heatmap.source_directions",
+        "gegi.heatmap.source_isotopes",
+        "gegi.activity.total_activity",
+        "gegi.activity.results"
+    )
 )
 
 $ErrorActionPreference = "Stop"
 
-# Full GeGI pipeline topics (driver + localization + reconstruction)
-$Topics = @(
-    "/compton_event",
-    "/spectrum_without_dose",
-    "/source_estimate",
-    "/source_heatmap",
-    "/source_peaks",
-    "/synthetic_plane_cloud",
-    "/compton_point_cloud"
-)
-
 function Test-ContainerRunning {
-    param([string]$Name)
+    param([Parameter(Mandatory = $true)][string]$Name)
 
-    $runningId = docker ps -q --filter "name=^${Name}$"
+    $runningId = & docker ps -q --filter "name=^${Name}$"
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to query Docker for container '${Name}'."
+        throw "Failed to query Docker for container '$Name'."
     }
 
     return -not [string]::IsNullOrWhiteSpace(($runningId | Out-String).Trim())
 }
 
 function Find-ContainerByImageHint {
-    param([string]$Hint)
+    param([Parameter(Mandatory = $true)][string]$Hint)
 
-    $rows = docker ps --format "{{.Names}}|{{.Image}}"
+    if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) {
+        return ""
+    }
+
+    $rows = & docker ps --format "{{.Names}}|{{.Image}}"
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to query running Docker containers."
     }
@@ -50,7 +74,7 @@ function Find-ContainerByImageHint {
 
         $name = $parts[0].Trim()
         $image = $parts[1].Trim()
-        if ($image -like "${Hint}*" -or $name -like "gegi*" -or $name -like "gemi*") {
+        if ($image -like "${Hint}*" -or $name -like "gegi*") {
             return $name
         }
     }
@@ -58,57 +82,145 @@ function Find-ContainerByImageHint {
     return ""
 }
 
-function New-RosTopicCommand {
+function ConvertTo-SingleQuotedLiteral {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function New-PrismWatcherCommand {
     param(
-        [string]$Topic,
-        [string]$SelectedMode,
-        [int]$N
+        [Parameter(Mandatory = $true)][string]$Topic,
+        [Parameter(Mandatory = $true)][string]$Target
     )
 
-    $setup = "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash"
+    $arguments = @(
+        $Mode,
+        "--protocol", "nats",
+        "--ip", $NatsHost,
+        "--port", $NatsPort.ToString(),
+        "--topic", $Topic,
+        "--duration", $DurationSeconds.ToString()
+    )
 
-    if ($SelectedMode -eq "hz") {
-        return "docker exec -it $ContainerName bash -lc '$setup; rostopic hz $Topic'"
+    if ($Mode -eq "echo" -and $SampleCount -gt 0) {
+        $arguments += @("--max", $SampleCount.ToString())
+    }
+    elseif ($Mode -eq "hz") {
+        $window = if ($null -eq $WindowSeconds) { 5 } else { $WindowSeconds.Value }
+        $arguments += @("--window", $window.ToString())
     }
 
-    if ($N -gt 0) {
-        return "docker exec -it $ContainerName bash -lc '$setup; rostopic echo -n $N $Topic'"
+    $quotedArguments = $arguments | ForEach-Object {
+        ConvertTo-SingleQuotedLiteral -Value ([string]$_)
     }
 
-    return "docker exec -it $ContainerName bash -lc '$setup; rostopic echo $Topic'"
-}
-
-if ([string]::IsNullOrWhiteSpace($ContainerName)) {
-    $ContainerName = Find-ContainerByImageHint -Hint $ImageHint
-}
-
-if ([string]::IsNullOrWhiteSpace($ContainerName) -or -not (Test-ContainerRunning -Name $ContainerName)) {
-    $runningNames = docker ps --format "{{.Names}}"
-    $runningText = (($runningNames | Out-String).Trim())
-    if ([string]::IsNullOrWhiteSpace($runningText)) {
-        $runningText = "(none)"
+    if ($Target -eq "Container") {
+        $prefix = @(
+            "& docker exec -it",
+            (ConvertTo-SingleQuotedLiteral -Value $ContainerName),
+            (ConvertTo-SingleQuotedLiteral -Value $PrismCommand)
+        ) -join " "
+        return "$prefix $($quotedArguments -join ' ')"
     }
 
-    throw "No matching GeGI container is running. Running containers: $runningText`nStart one first, e.g. .\start_gegi_reconstruction.ps1, then run .\watch_gegi_topics.ps1 -ContainerName <name>."
+    return "& $(ConvertTo-SingleQuotedLiteral -Value $PrismCommand) $($quotedArguments -join ' ')"
 }
 
-Write-Host "Opening watcher windows for container: $ContainerName"
-Write-Host "Mode: $Mode"
-if ($Mode -eq "echo" -and $SampleCount -gt 0) {
-    Write-Host "SampleCount: $SampleCount (rostopic echo -n)"
+if ($Topics.Count -eq 0 -or ($Topics | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -ne $Topics.Count) {
+    throw "Topics must contain at least one non-empty dot topic."
 }
 
 foreach ($topic in $Topics) {
-    $cmd = New-RosTopicCommand -Topic $topic -SelectedMode $Mode -N $SampleCount
-    $startupCmd = "`$Host.UI.RawUI.WindowTitle = 'GeGI $Mode $topic'; $cmd"
+    if ($topic.StartsWith("/") -or $topic -notmatch "^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$") {
+        throw "Invalid Prism topic '$topic'. Expected a dot-separated topic such as 'gegi.spectrum.histogram'."
+    }
+}
 
-    # Keep each window open for streaming output.
-    Start-Process powershell -ArgumentList @(
+if ($Mode -eq "hz" -and $SampleCount -ne 0) {
+    throw "-SampleCount is valid only with -Mode echo (Prism echo --max)."
+}
+
+if ($Mode -eq "echo" -and $null -ne $WindowSeconds) {
+    throw "-WindowSeconds is valid only with -Mode hz (Prism hz --window)."
+}
+
+if ($null -ne $WindowSeconds -and $WindowSeconds.Value -lt 1) {
+    throw "-WindowSeconds must be at least 1."
+}
+
+$resolvedTarget = $ExecutionTarget
+if ($ExecutionTarget -eq "Auto") {
+    if (-not [string]::IsNullOrWhiteSpace($ContainerName)) {
+        $resolvedTarget = "Container"
+    }
+    elseif ($null -ne (Get-Command $PrismCommand -ErrorAction SilentlyContinue)) {
+        $resolvedTarget = "Host"
+    }
+    else {
+        $ContainerName = Find-ContainerByImageHint -Hint $ImageHint
+        if (-not [string]::IsNullOrWhiteSpace($ContainerName)) {
+            $resolvedTarget = "Container"
+        }
+        else {
+            $resolvedTarget = "Host"
+        }
+    }
+}
+
+if ($resolvedTarget -eq "Container") {
+    if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) {
+        throw "Docker is not available. Use -ExecutionTarget Host or install Docker."
+    }
+    if ([string]::IsNullOrWhiteSpace($ContainerName)) {
+        $ContainerName = Find-ContainerByImageHint -Hint $ImageHint
+    }
+    if ([string]::IsNullOrWhiteSpace($ContainerName) -or -not (Test-ContainerRunning -Name $ContainerName)) {
+        throw "No matching running GeGi container was found. Pass -ContainerName <name> or use -ExecutionTarget Host."
+    }
+
+    & docker exec $ContainerName $PrismCommand --version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Prism CLI '$PrismCommand' is not executable in container '$ContainerName'. Pass its container path with -PrismCommand or use -ExecutionTarget Host."
+    }
+}
+else {
+    if ($null -eq (Get-Command $PrismCommand -ErrorAction SilentlyContinue)) {
+        throw "Prism CLI '$PrismCommand' was not found on the host. Add it to PATH or pass -PrismCommand <path>."
+    }
+
+    & $PrismCommand --version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Prism CLI '$PrismCommand' failed its version check."
+    }
+}
+
+$currentPowerShell = (Get-Process -Id $PID).Path
+Write-Host "Opening $Mode watchers via Prism CLI on: $resolvedTarget"
+if ($resolvedTarget -eq "Container") {
+    Write-Host "Container: $ContainerName"
+}
+Write-Host "NATS: ${NatsHost}:$NatsPort"
+Write-Host "Duration: $DurationSeconds seconds"
+if ($Mode -eq "echo" -and $SampleCount -gt 0) {
+    Write-Host "Maximum messages per topic: $SampleCount"
+}
+if ($Mode -eq "hz") {
+    $displayWindow = if ($null -eq $WindowSeconds) { 5 } else { $WindowSeconds.Value }
+    Write-Host "Rate window: $displayWindow seconds"
+}
+
+foreach ($topic in $Topics) {
+    $command = New-PrismWatcherCommand -Topic $topic -Target $resolvedTarget
+    $startupScript = "`$Host.UI.RawUI.WindowTitle = 'GeGi $Mode $topic'; $command"
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($startupScript))
+
+    Start-Process $currentPowerShell -ArgumentList @(
         "-NoExit",
-        "-Command",
-        $startupCmd
+        "-EncodedCommand",
+        $encodedCommand
     ) | Out-Null
 }
 
 Write-Host "Launched $($Topics.Count) watcher windows."
-Write-Host "Tip: Use Ctrl+C in a watcher window to stop that topic monitor."
+Write-Host "Use Ctrl+C in a watcher window to stop it early."

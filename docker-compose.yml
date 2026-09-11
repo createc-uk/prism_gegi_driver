@@ -1,0 +1,28 @@
+services:
+  nats:
+    image: nats:2-alpine
+    ports:
+      - "4222:4222"
+    restart: unless-stopped
+
+  app:
+    container_name: gegi_live
+    image: prism-gegi-driver:latest
+    build:
+      context: .
+      dockerfile: docker/dockerfiles/phds_gegi_amd64
+    depends_on:
+      - nats
+    environment:
+      PRISM_PROTOCOL: nats
+      PRISM_SERVER: nats
+      PRISM_PORT: "4222"
+      OUTPUT_DIR: /opt/phds_gegi_driver/data
+      DETECTOR_IP: ${DETECTOR_IP:-192.168.50.109}
+      DETECTOR_PORT: ${DETECTOR_PORT:-27015}
+    volumes:
+      - gegi-data:/opt/phds_gegi_driver/data
+    restart: unless-stopped
+
+volumes:
+  gegi-data:

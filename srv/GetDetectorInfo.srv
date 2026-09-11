@@ -1,9 +1,0 @@
----
-bool success
-string serial_number
-float64 detector_temp_kelvin
-int32 detector_bias_status
-int32 line_power_status
-int32 batt1_percent
-int32 batt2_percent
-string message

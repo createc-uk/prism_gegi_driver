@@ -1,0 +1,19 @@
+# Prism endpoint overrides for the C++ multi-endpoint GeGi driver.
+# Endpoint IDs and defaults mirror PhdsGegiDriver's compiled configuration.
+endpoints:
+  compton_event:
+    name: gegi.driver.compton_event
+  energy_deposit:
+    name: gegi.driver.energy_deposit
+  energy_deposit_singles:
+    name: gegi.driver.energy_deposit_singles
+  run_info:
+    name: gegi.detector.run_info
+  detector_info:
+    name: gegi.detector.detector_info
+  dead_time_percent:
+    name: gegi.detector.dead_time_percent
+  command:
+    name: gegi.detector.command
+  command_result:
+    name: gegi.detector.command_result

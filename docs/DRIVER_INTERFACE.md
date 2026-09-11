@@ -1,4 +1,9 @@
-# GeGI Driver — Messaging & Integration Interface
+# GeGI Driver — Messaging & Integration Interface (legacy ROS baseline)
+
+> **Historical document:** this records the pre-migration ROS 1 interface that
+> was used as the source inventory. It is no longer the runtime contract. See
+> [`PRISM_MIGRATION.md`](PRISM_MIGRATION.md) for the implemented Prism topics,
+> commands, wire schemas, build, and integration instructions.
 
 Handover reference for integrating this driver into PRISM. It describes the
 messaging system, the full topic/service surface, message definitions, and the

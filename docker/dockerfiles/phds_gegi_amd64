@@ -1,106 +1,82 @@
 ARG DEFAULT_WORKING_DIRECTORY=/opt/phds_gegi_driver
 
-# First set up base image with all deps installed
-FROM osrf/ros:melodic-desktop AS base
+FROM ubuntu:22.04 AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG DEFAULT_WORKING_DIRECTORY
 
-SHELL ["/bin/bash", "-c"]
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 USER root
 
-ARG DEFAULT_WORKING_DIRECTORY
-ENV WORKING_DIRECTORY=$DEFAULT_WORKING_DIRECTORY
+ENV WORKING_DIRECTORY=${DEFAULT_WORKING_DIRECTORY} \
+    PYTHONUNBUFFERED=1
 
-COPY ./setup/phds_gegi_driver ${WORKING_DIRECTORY}/scripts
+COPY ./setup/phds_gegi_driver/setup_dependencies.sh /tmp/setup_dependencies.sh
+RUN chmod +x /tmp/setup_dependencies.sh \
+    && /tmp/setup_dependencies.sh \
+    && rm -f /tmp/setup_dependencies.sh
 
-WORKDIR ${WORKING_DIRECTORY}/scripts
-
-RUN ./setup_dependencies.sh
-
-# Keep network-dependent apt installs in the reusable base stage so source code
-# changes do not force a fresh internet fetch during later rebuilds.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3-pip \
-        python3-matplotlib \
-        python3-numpy \
-        python-scipy \
-        ros-melodic-rosbag \
-        ros-melodic-rosbridge-server \
-        ros-melodic-rosbridge-suite \
-    && rm -rf /var/lib/apt/lists/*
-
-# Do the build in a sacrificial temp image
-FROM base AS intermediate
-
-ARG DEBIAN_FRONTEND=noninteractive
-
-SHELL ["/bin/bash", "-c"]
-USER root
+FROM base AS builder
 
 ARG DEFAULT_WORKING_DIRECTORY
-ENV WORKING_DIRECTORY=$DEFAULT_WORKING_DIRECTORY
+ENV WORKING_DIRECTORY=${DEFAULT_WORKING_DIRECTORY}
 
-COPY ./deps/radiation_detector_msgs ${WORKING_DIRECTORY}/src/radiation_detector_msgs
-COPY . ${WORKING_DIRECTORY}/src/phds_gegi_driver
+WORKDIR /build-source
 
-WORKDIR ${WORKING_DIRECTORY}
+# Keep the C++ driver build separate from the Python binding build: the driver
+# project intentionally forces PSM_BUILD_PYTHON_BINDINGS=OFF.
+COPY ./CMakeLists.txt ./CMakeLists.txt
+COPY ./include ./include
+COPY ./src ./src
+COPY ./deps ./deps
 
-RUN source /opt/ros/melodic/setup.bash && catkin_make clean && catkin_make
+RUN cmake -S /build-source -B /tmp/phds-gegi-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_PSM_TOOLS=OFF \
+        -DNATSMESSAGING_BUILD_TESTS=OFF \
+    && cmake --build /tmp/phds-gegi-build \
+        --target phds_gegi_driver_node \
+        --parallel \
+    && install -D -m 0755 \
+        /tmp/phds-gegi-build/bin/phds_gegi_driver_node \
+        ${WORKING_DIRECTORY}/bin/phds_gegi_driver_node
 
-# Install Python nodes into devel space before source cleanup
-RUN mkdir -p ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver && \
-    cp ${WORKING_DIRECTORY}/src/phds_gegi_driver/src/phds_gegi_driver/spectrum_node.py \
-       ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/spectrum_node.py && \
-    cp ${WORKING_DIRECTORY}/src/phds_gegi_driver/src/phds_gegi_driver/spherical_heatmap_node.py \
-       ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/spherical_heatmap_node.py && \
-    cp ${WORKING_DIRECTORY}/src/phds_gegi_driver/src/phds_gegi_driver/activity_node.py \
-       ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/activity_node.py && \
-    cp ${WORKING_DIRECTORY}/src/phds_gegi_driver/src/phds_gegi_driver/data_recorder_node.py \
-       ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/data_recorder_node.py && \
-    sed -i 's/\r$//' ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/*.py && \
-    chmod +x ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/*.py
+# Prism's pyproject.toml uses scikit-build-core and enables the bindings with
+# PSM_BUILD_PYTHON_BINDINGS=ON. This is the pip installation flow documented by
+# the vendored Prism develop branch.
+RUN python3 -m pip install --no-cache-dir \
+        --target /opt/prism-python \
+        /build-source/deps/prism/bindings/python \
+    && PYTHONPATH=/opt/prism-python python3 -c "import prism"
 
-# Create data output directory
-RUN mkdir -p /opt/phds_gegi_driver/data
+FROM base AS runtime
 
-#Remove the source & include directories and .git folders that remain
-RUN find ${WORKING_DIRECTORY}/src/phds_gegi_driver -type d -and -name src -exec rm -rv {} \; || true
-RUN find ${WORKING_DIRECTORY}/src/phds_gegi_driver -type d -and -name include -exec rm -rv {} \; || true
-RUN find ${WORKING_DIRECTORY}/src/phds_gegi_driver -type d -and -name '.git' -exec rm -rv {} \; || true
+ARG DEFAULT_WORKING_DIRECTORY
+ENV WORKING_DIRECTORY=${DEFAULT_WORKING_DIRECTORY} \
+    PATH=${DEFAULT_WORKING_DIRECTORY}/bin:/opt/prism-python/bin:${PATH} \
+    DRIVER_EXECUTABLE=${DEFAULT_WORKING_DIRECTORY}/bin/phds_gegi_driver_node
 
-#for debugging
+LABEL description="Createc PHDS GeGi driver using Prism messaging over NATS"
+
+COPY --from=builder /opt/prism-python /opt/prism-python
+COPY --from=builder ${DEFAULT_WORKING_DIRECTORY}/bin ${DEFAULT_WORKING_DIRECTORY}/bin
+
+# Retain the Python runtime nodes, detector configuration, and operational tools.
+COPY ./src/phds_gegi_driver ${DEFAULT_WORKING_DIRECTORY}/src/phds_gegi_driver
+COPY ./config ${DEFAULT_WORKING_DIRECTORY}/config
+COPY ./tools ${DEFAULT_WORKING_DIRECTORY}/tools
+COPY ./scripts ${DEFAULT_WORKING_DIRECTORY}/scripts
+
+RUN chmod +x ${DEFAULT_WORKING_DIRECTORY}/scripts/run_full_pipeline.sh \
+    && mkdir -p ${DEFAULT_WORKING_DIRECTORY}/data
+
 COPY --chown=root:root ./docker/entrypoints/phds_gegi_entrypoint.sh /phds_gegi_entrypoint.sh
-RUN sed -i 's/\r$//' /phds_gegi_entrypoint.sh && chmod +x /phds_gegi_entrypoint.sh
+RUN sed -i 's/\r$//' /phds_gegi_entrypoint.sh \
+    && chmod +x /phds_gegi_entrypoint.sh
+
+WORKDIR ${DEFAULT_WORKING_DIRECTORY}
+VOLUME ["/opt/phds_gegi_driver/data"]
+
 ENTRYPOINT ["/phds_gegi_entrypoint.sh"]
 
-#=============================================
-
-#The real output, copy the build output
-FROM base
-
-ARG DEBIAN_FRONTEND=noninteractive
-
-SHELL ["/bin/bash", "-c"]
-
-ARG DEFAULT_WORKING_DIRECTORY
-ENV WORKING_DIRECTORY=$DEFAULT_WORKING_DIRECTORY
-
-LABEL maintainer="michael.friedman"
-LABEL contact=michael.friedman@createc.co.uk
-LABEL description="Createc PHDS GeGi driver node"
-LABEL example_usage="docker run --network=host --env ROS_MASTER_URI=http://localhost:11311 -it phds_gegi bash --- then --- roslaunch phds_gegi_driver gegi_driver.launch in container"
-
-#Copy built stuffs
-COPY --from=intermediate ${WORKING_DIRECTORY} ${WORKING_DIRECTORY}
-
-WORKDIR ${WORKING_DIRECTORY}
-
-#Copy entrypoint (cribbed from ROS' docker version)
-COPY --chown=root:root ./docker/entrypoints/phds_gegi_entrypoint.sh /phds_gegi_entrypoint.sh
-RUN sed -i 's/\r$//' /phds_gegi_entrypoint.sh && chmod +x /phds_gegi_entrypoint.sh
-
-# Bag output mountpoint — map this to a host path when running
-RUN mkdir -p /bags
-VOLUME /bags
-
-ENTRYPOINT ["/phds_gegi_entrypoint.sh"]
+CMD ["/opt/phds_gegi_driver/scripts/run_full_pipeline.sh"]

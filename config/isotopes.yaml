@@ -19,32 +19,38 @@ gamma_constants:
   Cs137: 0.0771
   Co60: 0.3059
 
-# Counting window: how many seconds of spectra to accumulate before computing activity.
-counting_window_s: 60.0
+# Counting window: seconds of spectra accumulated before an activity row is emitted.
+# 300 s => a typical 5-min run is ONE window (one activity row per run); the data
+# recorder flushes the final partial window at stop so no tail is lost. Lower it
+# (e.g. 60) if you want intra-run time resolution. NOTE: activity.launch passes a
+# counting_window_s param that OVERRIDES this value at runtime - keep them in sync.
+counting_window_s: 300.0
 
-# Minimum net counts required for a valid activity estimate (per philosophy doc: 400)
+# Minimum net counts for a window's per-window `valid` flag. This is now only a
+# LIVE-DISPLAY hint: detection and the saved activity are decided at RUN level
+# (Currie L_C over the run total), so this no longer gates the saved assay.
 min_net_counts: 400
 
-# Source distance in metres. When set (> 0), the node auto-computes the
-# solid angle fraction and applies a distance correction to calibration factors.
-# This makes measured activity distance-independent.
-# Set to 0 to disable (uses raw calibration factor assuming calibration geometry).
-# Upward-facing mount: this is the BARE (0-steel) source-to-detector-face distance.
-# The permanent 5 mm shield (base_shield_plates below) plus any operator plates are
-# added on top, so the measured 33 cm (which includes the permanent plate) = 0.325
-# + 1*0.005. The effective distance is derived from the plate count at runtime.
-source_distance_m: 0.325
+# Source distance in metres (detector face to source). When set (> 0), the node
+# auto-computes the solid angle fraction and applies a distance correction.
+# Rig (2026-08-06): source on a plywood table 580 mm above the detector face, with
+# a permanent 5 mm steel plate and 11 mm plywood in the beam. This is the base
+# (0-EXTRA-plate) distance; extra operator plates are added on top (see shielding).
+source_distance_m: 0.580
 
-# Distance at which the empirical calibration factors were measured.
-calibration_distance_m: 0.5
+# Distance at which the calibration factors were derived = the OPERATIONAL geometry
+# (580 mm). Calibration is done IN PLACE (plywood table + permanent steel plate
+# present), so the CF absorbs those permanent attenuators; only EXTRA plates get an
+# explicit steel correction. See the shielding block and each isotope's CF note.
+calibration_distance_m: 0.580
 
 # Geometric solid angle fraction: Omega / (4*pi)
 # For a point source at distance d from a circular crystal of radius r:
 #   solid_angle_fraction = 0.5 * (1 - d / sqrt(d^2 + r^2))
 # GeGI crystal: 90-mm diameter (r = 0.045 m), 11-mm thick, active area 61 cm2.
-# At d = 0.5 m: 0.5*(1 - 0.5/sqrt(0.25+0.002025)) = 0.00202
+# At d = 0.580 m: 0.5*(1 - 0.580/sqrt(0.3364+0.002025)) = 0.001498
 # NOTE: If source_distance_m is set, solid_angle_fraction is auto-computed.
-solid_angle_fraction: 0.00202
+solid_angle_fraction: 0.001498
 
 # Detector crystal radius (m), used in the solid-angle formula above.
 # GeGI: 90-mm diameter -> r = 0.045 m. (Previously hardcoded in the driver.)
@@ -52,22 +58,27 @@ crystal_radius_m: 0.045
 
 # ---------------------------------------------------------------------------
 # In-line shielding for high-activity trays.
-# The GeGI is on an upward-facing frame with a permanent 5 mm steel plate over
-# the crystal (base_shield_plates). When a tray is too hot, further identical
-# plates are added on top. The operator sets only the EXTRA plate count via the
-# ~n_shielding_plates parameter or the ~/n_shielding_plates topic (std_msgs/Int32):
+# The GeGI is on an upward-facing frame. In the beam PERMANENTLY: an 11 mm plywood
+# table and a 5 mm steel plate. These are present during calibration, so their
+# attenuation is ABSORBED into the calibration_factor (calibrate-in-place) rather
+# than corrected explicitly -> base_shield_plates = 0. When a tray is too hot, the
+# operator adds further identical 5 mm steel plates on top and sets only the EXTRA
+# plate count via ~n_shielding_plates (or the ~/n_shielding_plates Int32 topic):
 #   0 for a normal tray, 1/2/3... for hot ones.
-# total_plates = base_shield_plates + n_shielding_plates, and the driver derives
-# BOTH of the following from it, with no code change:
+# total_plates = base_shield_plates (0) + n_shielding_plates, and the driver derives:
 #   source_distance_m = base_standoff_m + total_plates * plate_thickness_m
 #   transmission(E)   = exp(-mu_shield_per_m(E) * total_plates * plate_thickness_m)
-# Activity is corrected by dividing the measured value by transmission(E).
-# mu is energy-dependent, so it is set per gamma line on each isotope below.
+# So a normal tray applies NO explicit shield correction (it is in the CF); each
+# EXTRA plate applies one plate's steel transmission and raises the standoff 5 mm.
+# NOTE: base_standoff_m is the MEASURED 580 mm face-to-source (plywood + permanent
+# plate are within it, not added to it).
+# Calibration factors below were re-derived 2026-08-07 in THIS geometry (in-place,
+# background-subtracted) - see each isotope's note.
 shielding:
   material: "steel"            # carbon steel, rho ~7.87 g/cm3
-  plate_thickness_m: 0.005     # 5 mm per plate
-  base_standoff_m: 0.325       # BARE 0-steel source-detector-face distance
-  base_shield_plates: 1        # permanent mounted plate(s) always in the beam
+  plate_thickness_m: 0.005     # 5 mm per EXTRA plate
+  base_standoff_m: 0.580       # measured face-to-source (0 extra plates)
+  base_shield_plates: 0        # permanent plate is in the CF, not corrected here
 # ---------------------------------------------------------------------------
 
 isotopes:
@@ -77,10 +88,19 @@ isotopes:
     peak_roi_keV: [655.0, 669.0]
     left_sideband_keV: [620.0, 645.0]
     right_sideband_keV: [680.0, 705.0]
-    # Empirical calibration factor (Bq/cps) measured at calibration_distance_m (0.5m).
-    # Used to DERIVE geometry-independent intrinsic efficiency:
-    #   eps_intrinsic = 1 / (CF * omega_cal * I_gamma) = 0.012783
-    calibration_factor: 45672.0
+    # Empirical calibration factor (Bq/cps), RECALIBRATED 2026-09-04 from the
+    # CLEAN-PIPELINE run 20260904_084851 (580 mm calibrate-in-place, full
+    # detector clear at run start - the retention fix). Cs-137 BH-4106
+    # 2.88 MBq decay-corrected to 2.86279 MBq at 2026-09-04:
+    # CF = 2862790 / (36.2938 cps * 1.00639 dt) = 78377.
+    # Supersedes 75819 (2026-08-27): the GeGI re-streams ~3-5% of retained
+    # spectral content unless fully cleared ('x') before each run; the
+    # Aug-26 calibration run carried that contamination, inflating its net
+    # cps and deflating the CF ~3.4% - clean runs then read ~-3% low
+    # (confirmed 2026-09-04: bag event-rate profile flat from run start,
+    # so the deficit was real, not a post-clear streaming ramp).
+    # A = CF * net_cps * dt_factor at the calibration geometry.
+    calibration_factor: 78377.0
     # OPTIONAL manual override: absolute full-energy-peak efficiency at the
     # measurement geometry. LEAVE 0.0 to use the calibration_factor-derived,
     # geometry-independent path above (this is the intended mode). A value > 0
@@ -89,8 +109,19 @@ isotopes:
     efficiency: 0.0
     # Linear attenuation coefficient (1/m) of the shielding-plate material at
     # 662 keV. transmission = exp(-mu_shield_per_m * n_plates * plate_thickness_m).
-    # Steel at 662 keV: mu/rho ~0.0729 cm2/g * 7.87 g/cm3 = 0.574/cm = 57.4/m.
-    mu_shield_per_m: 57.4
+    # EFFECTIVE (broad-beam) value RE-MEASURED 2026-09-04 on the CLEAN
+    # pipeline (full clear per run), Exp F Cs137 runs 20260904_084851/
+    # 090232/090917 (0/1/2 extra plates, geometry-corrected net rates,
+    # log-linear fit, per-point residuals <1%): 48.6 +- ~2.5 /m.
+    # Supersedes 51.4 (2026-09-03: sequence contaminated by detector
+    # retention re-streaming). Build-up in this close geometry makes the
+    # effective mu ~15% below the narrow-beam 57.4/m
+    # (mu/rho 0.0729 cm2/g * 7.87 g/cm3).
+    mu_shield_per_m: 48.6
+    # Measured broad-beam transmissions per EXTRA-plate count (clean runs
+    # 20260904_084851/090232/090917, geometry-corrected). Exact values used
+    # for 1-2 plates; >2 extrapolates from T(2) with mu_shield_per_m.
+    plate_transmission: {1: 0.7915, 2: 0.6125}
 
   Co60_1173:
     energy_keV: 1173.2
@@ -98,37 +129,60 @@ isotopes:
     peak_roi_keV: [1165.0, 1181.0]
     left_sideband_keV: [1140.0, 1158.0]
     right_sideband_keV: [1190.0, 1208.0]
-    # Corrected 2026-07-09 from 117730.0 (-8.7%) by DJR Assay Experiment B:
-    #   certificated 1.130 MBq Co-60 (ref 2026-06-01) read +9.5% high at 0.33 m
-    #   through 1 plate; 15-min run data/Experiment B/Co60/20260709_130120.
-    #   New CF sets the 1173 keV line to the decay-corrected certificate and
-    #   makes eps(1173)/eps(1332) match the measured photopeak ratio (1.453).
-    #   Original 0.5 m derivation gave eps_intrinsic = 0.004226. Reconfirm on an
-    #   independent run before treating as final (+-3-5% certificate uncertainty).
-    calibration_factor: 107490.0
+    # RECALIBRATED 2026-08-27 from Experiment B run 20260826_162407 (corrected
+    # pipeline - see the Cs137 CF note). Co-60 BH-4103 1.13 MBq decay-corrected
+    # to 1.09555 MBq at 2026-08-26. Supersedes 163431 (2026-08-07, live-time-
+    # inflated ~7%).
+    calibration_factor: 152660.0
     # OPTIONAL manual override (see Cs137 note): leave 0.0 to derive efficiency
     # from calibration_factor. Only used if calibration_factor is absent.
     efficiency: 0.0
-    # Steel at 1173 keV: mu/rho ~0.0531 cm2/g * 7.87 = 0.418/cm = 41.8/m.
-    mu_shield_per_m: 41.8
+    # Steel at 1173 keV: mu/rho ~0.0531 cm2/g * 7.87 = 0.418/cm = 41.8/m
+    # (narrow-beam). The MEASURED broad-beam behaviour (clean source-
+    # untouched triplet 20260904_163328/164306/164946) is NOT a single
+    # exponential: plate 1 transmits at ~narrow-beam (T=0.814,
+    # mu_eff 41.1) while plate 2 adds build-up (cumulative T=0.718,
+    # mu_eff 33.2) - hence the measured table below rules for 1-2 plates
+    # and this mu is only the >2-plate extrapolation slope. The per-line LSQ
+    # slopes (34.8 here, 36.2 at 1332) invert the physical energy ordering
+    # within their ~1-sigma noise, so both Co lines carry the pooled value
+    # (35.5/35.0, ordering preserved).
+    mu_shield_per_m: 35.5
+    # T(1) = mean of TWO independent source-untouched pair measurements
+    # (0.8141 triplet 16:33-16:49; 0.8562 pair 17:48-17:55, both 2026-09-04;
+    # they differ 5.2% = ~1.6 sigma counting - single-pair T carries ~+-3%).
+    # T(2) from the triplet's direct 2-plate/anchor ratio.
+    plate_transmission: {1: 0.835, 2: 0.7178}
 
   Co60_1332:
     energy_keV: 1332.5
     emission_probability: 0.9998
     peak_roi_keV: [1325.0, 1340.0]
-    left_sideband_keV: [1300.0, 1318.0]
+    # Left sideband starts at 1304 (was 1300): Eu-152's 1299.14 keV line
+    # (1.62%) fell INSIDE the old 1300-1318 window, inflating the background
+    # estimate and dragging the 1332 activity ~18% low whenever Eu-152 was in
+    # the field (measured 2026-08-26). 1304 is +2.2 FWHM above 1299.1 - clear
+    # of the Eu tail, still 21 keV below the ROI. In a clean Cs+Co field the
+    # continuum is linear so the net area (and the CF) are unchanged.
+    left_sideband_keV: [1304.0, 1322.0]
     right_sideband_keV: [1348.0, 1366.0]
-    # Corrected 2026-07-09 by DJR Assay Experiment B (163393.0 -> 155990.0), then
-    # REFINED to 152010.0 by Experiment D (10x 5-min Co-60, data/Experiment D/):
-    #   the 1332 line still read +2.6% high vs the certificate over 10 runs, so
-    #   CF reduced a further 2.6% to centre it (1173 line was already on cert).
-    #   certificate 1.130 MBq Co-60, ref 2026-06-01. Original 0.5 m derivation
-    #   gave eps_intrinsic = 0.003041. Repeatability (Type A) = 2.1%.
-    calibration_factor: 152010.0
+    # RECALIBRATED 2026-08-27 from Experiment B run 20260826_162407 (corrected
+    # pipeline - see the Cs137 CF note). Co-60 1.09555 MBq at 2026-08-26.
+    # Supersedes 228724 (2026-08-07, live-time-inflated ~5%). The 1332/1173
+    # CF ratio 1.42 = the measured photopeak-efficiency ratio.
+    calibration_factor: 216707.0
     # OPTIONAL manual override (see Cs137 note): leave 0.0 to derive efficiency
     # from calibration_factor. Only used if calibration_factor is absent.
     efficiency: 0.0
-    # Steel at 1332 keV: mu/rho ~0.0503 cm2/g * 7.87 = 0.396/cm = 39.6/m.
-    mu_shield_per_m: 39.6
+    # Steel at 1332 keV: mu/rho ~0.0503 cm2/g * 7.87 = 0.396/cm = 39.6/m
+    # (narrow-beam). Measured broad-beam table (clean triplet, see the
+    # Co60_1173 note): plate 1 ~narrow-beam (T=0.818, mu_eff 40.1),
+    # plate 2 adds build-up (cumulative T=0.703, mu_eff 35.3). Table rules
+    # for 1-2 plates; this mu only extrapolates beyond (pooled Co slope,
+    # see the Co60_1173 note).
+    mu_shield_per_m: 35.0
+    # T(1) = mean of the two source-untouched determinations (0.8183, 0.8308
+    # - see the Co60_1173 note); T(2) from the triplet.
+    plate_transmission: {1: 0.825, 2: 0.7028}
 
 

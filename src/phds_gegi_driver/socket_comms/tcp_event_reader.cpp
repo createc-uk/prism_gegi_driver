@@ -94,6 +94,56 @@ namespace phds_gegi_driver::socket_comms {
             return output;
         }
 
+        // Try to decode a detector run-info frame at the front of `b` (with `avail`
+        // bytes available). The detector interleaves these 28/32-byte frames into
+        // the event stream in reply to the 'i' command; the monitor thread calls
+        // this at packet boundaries so the frame is CAPTURED inline instead of
+        // discarded during resync. dead_time is RECOMPUTED from (1 - live/real)
+        // rather than trusting the detector's dead field (observed self-inconsistent).
+        // The checks are kept strict so stray event-packet bytes are very unlikely
+        // to pass. On success sets `out` and `consumed` (28 or 32) and returns true.
+        bool tryDecodeRunInfo(const char *b, size_t avail, RunInfo &out, size_t &consumed) {
+            auto plausible = [](double real, double live, double rate) -> bool {
+                if (!std::isfinite(real) || !std::isfinite(live) || !std::isfinite(rate)) return false;
+                if (real == 0.0 && live == 0.0 && rate == 0.0) return true;   // idle frame
+                if (real < 1.0 || real > 86400.0) return false;
+                if (live < 0.0 || live > real + 0.001) return false;
+                if (rate < 1.0 || rate > 1.0e7) return false;
+                const double lf = live / real;
+                if (lf < 0.5 || lf > 1.001) return false;   // active dead-time < 50%
+                return true;
+            };
+            auto fill = [&](double real, double live, double rate, size_t used) {
+                out.real_time_sec = real;
+                out.live_time_sec = live;
+                out.count_rate_hz = rate;
+                out.dead_time_percent = (real > 0.0) ? 100.0 * (1.0 - live / real) : 0.0;
+                consumed = used;
+            };
+            // Layout A: packed 28B  (u32 real@0, f64 live@4,  f64 dead@12, f64 rate@20)
+            if (avail >= 28) {
+                const double real = static_cast<double>(readU32(b + 0, false));
+                const double live = readF64(b + 4, false);
+                const double rate = readF64(b + 20, false);
+                if (plausible(real, live, rate)) { fill(real, live, rate, 28); return true; }
+            }
+            // Layout B: aligned 32B (u32 real@0, pad, f64 live@8, f64 dead@16, f64 rate@24)
+            if (avail >= 32) {
+                const double real = static_cast<double>(readU32(b + 0, false));
+                const double live = readF64(b + 8, false);
+                const double rate = readF64(b + 24, false);
+                if (plausible(real, live, rate)) { fill(real, live, rate, 32); return true; }
+            }
+            // Layout C: all-f64 32B (f64 real@0, f64 live@8, f64 dead@16, f64 rate@24)
+            if (avail >= 32) {
+                const double real = readF64(b + 0, false);
+                const double live = readF64(b + 8, false);
+                const double rate = readF64(b + 24, false);
+                if (plausible(real, live, rate)) { fill(real, live, rate, 32); return true; }
+            }
+            return false;
+        }
+
         void flushSocketInputBuffer(boost::asio::ip::tcp::socket &socket, size_t max_bytes = 1 << 20) {
             size_t drained_total = 0;
             for (;;) {
@@ -177,6 +227,16 @@ namespace phds_gegi_driver::socket_comms {
         }
 
         monitoring_thread_ = std::thread(&TcpEventReader::monitorSocket, this);
+    }
+
+    void TcpEventReader::setEnergyCorrection(double c0, double c1, double c2) {
+        ecal_c0_ = c0;
+        ecal_c1_ = c1;
+        ecal_c2_ = c2;
+        if (c0 != 0.0 || c1 != 1.0 || c2 != 0.0) {
+            std::cout << "Energy-scale correction active: E_true = " << c0
+                      << " + " << c1 << "*E + " << c2 << "*E^2" << std::endl;
+        }
     }
 
     void TcpEventReader::monitorSocket() {
@@ -278,6 +338,23 @@ namespace phds_gegi_driver::socket_comms {
             while (stream_buffer.size() >= SINGLE_SITE_BYTES) {
                 // Try to find a valid frame header at current position
                 if (!validate_header(0, stream_buffer.size())) {
+                    // Not an event header. Before discarding, check for a detector
+                    // run-info frame (the 'i' reply) interleaved in the stream and
+                    // CAPTURE it inline — so getRunInfo() reads it from here rather
+                    // than a competing socket read that starves and drops events.
+                    RunInfo ri;
+                    size_t ri_bytes = 0;
+                    if (tryDecodeRunInfo(stream_buffer.data(), stream_buffer.size(), ri, ri_bytes)) {
+                        {
+                            std::lock_guard<std::mutex> lk(run_info_mutex_);
+                            latest_run_info_ = ri;
+                        }
+                        have_run_info_.store(true);
+                        run_info_seq_.fetch_add(1);
+                        stream_buffer.erase(stream_buffer.begin(),
+                                            stream_buffer.begin() + static_cast<long long>(ri_bytes));
+                        continue;
+                    }
                     // Out of sync — discard one byte and retry
                     stream_buffer.erase(stream_buffer.begin());
                     continue;
@@ -301,7 +378,7 @@ namespace phds_gegi_driver::socket_comms {
                 const double x1 = read_double_buf(stream_buffer, 12);
                 const double y1 = read_double_buf(stream_buffer, 20);
                 const double z1 = read_double_buf(stream_buffer, 28);
-                const double e1 = read_double_buf(stream_buffer, 36);
+                const double e1 = correctEnergy(read_double_buf(stream_buffer, 36));
 
                 if (event_type == 0) {
                     // Single-site event
@@ -318,7 +395,7 @@ namespace phds_gegi_driver::socket_comms {
                     const double x2 = read_double_buf(stream_buffer, 44);
                     const double y2 = read_double_buf(stream_buffer, 52);
                     const double z2 = read_double_buf(stream_buffer, 60);
-                    const double e2 = read_double_buf(stream_buffer, 68);
+                    const double e2 = correctEnergy(read_double_buf(stream_buffer, 68));
 
                     // Treat as 1-site if second interaction is invalid
                     const bool site2_valid = std::isfinite(x2) && std::isfinite(y2) &&
@@ -358,7 +435,7 @@ namespace phds_gegi_driver::socket_comms {
                     const double x2 = read_double_buf(stream_buffer, 44);
                     const double y2 = read_double_buf(stream_buffer, 52);
                     const double z2 = read_double_buf(stream_buffer, 60);
-                    const double e2 = read_double_buf(stream_buffer, 68);
+                    const double e2 = correctEnergy(read_double_buf(stream_buffer, 68));
                     const double compton_angle = read_double_buf(stream_buffer, 76);
                     const double delta_compton_angle = read_double_buf(stream_buffer, 84);
 
@@ -564,155 +641,51 @@ namespace phds_gegi_driver::socket_comms {
     }
 
     RunInfo TcpEventReader::getRunInfo() {
+        // The monitor thread is the SOLE socket reader; it parses run-info frames
+        // INLINE as they stream past (see monitorSocket + tryDecodeRunInfo). Here we
+        // only PROMPT the detector with 'i' (a 1-byte write, no read) and wait for
+        // the monitor to publish a fresh frame. A status query therefore never races
+        // the event stream or discards event data, at any rate. If no fresh frame
+        // arrives within the timeout we return NaN so the caller sees an invalid
+        // read (success=false) rather than a stale or wrong-run value.
         RunInfo info;
-        if (!socket_.is_open() && !command_socket_.is_open()) {
+        if (!socket_.is_open()) {
             std::cerr << "Socket not open; cannot request run info" << std::endl;
+            info.real_time_sec = std::numeric_limits<double>::quiet_NaN();
+            info.live_time_sec = std::numeric_limits<double>::quiet_NaN();
+            info.dead_time_percent = std::numeric_limits<double>::quiet_NaN();
+            info.count_rate_hz = std::numeric_limits<double>::quiet_NaN();
             return info;
         }
 
-        try {
-            std::lock_guard<std::mutex> command_lock(command_mutex_);
+        const std::uint64_t seq_before = run_info_seq_.load();
+        sendCommand('i');  // prompt only; sendCommand already guards socket_mutex_
 
-            // Use command_socket_ if available (it receives events + responses
-            // from the detector). Fall back to stream socket if not open.
-            boost::asio::ip::tcp::socket &response_socket = command_socket_.is_open() ? command_socket_ : socket_;
-            const bool using_event_socket = (&response_socket == &socket_);
-
-            std::unique_lock<std::mutex> resp_lock(response_mutex_, std::defer_lock);
-            std::unique_lock<std::mutex> event_lock(socket_mutex_, std::defer_lock);
-            if (using_event_socket) {
-                resp_lock.lock();
-                event_lock.lock();
-            }
-
-            // Run-info frame for command 'i'. The manual lists the LOGICAL fields
-            //   int32 realTime; double liveTime; double deadTimePercentage; double countRate;
-            // but the on-wire byte layout depends on the sender's struct alignment,
-            // so we try the plausible layouts and accept the first self-consistent
-            // one (the dead ~= (1-live/real)*100 check disambiguates):
-            //   A) packed  (28B): u32@0,       f64@4,  f64@12, f64@20
-            //   B) aligned (32B): u32@0,+4 pad, f64@8,  f64@16, f64@24  (double 8-byte aligned)
-            //   C) all-f64 (32B): f64@0,        f64@8,  f64@16, f64@24  (realTime sent as double)
-            auto decode_A = [&](const char *b) {
-                RunInfo d;
-                d.real_time_sec = static_cast<double>(readU32(b + 0, false));
-                d.live_time_sec = readF64(b + 4, false);
-                d.dead_time_percent = readF64(b + 12, false);
-                d.count_rate_hz = readF64(b + 20, false);
-                return d;
-            };
-            auto decode_B = [&](const char *b) {
-                RunInfo d;
-                d.real_time_sec = static_cast<double>(readU32(b + 0, false));
-                d.live_time_sec = readF64(b + 8, false);
-                d.dead_time_percent = readF64(b + 16, false);
-                d.count_rate_hz = readF64(b + 24, false);
-                return d;
-            };
-            auto decode_C = [&](const char *b) {
-                RunInfo d;
-                d.real_time_sec = readF64(b + 0, false);
-                d.live_time_sec = readF64(b + 8, false);
-                d.dead_time_percent = readF64(b + 16, false);
-                d.count_rate_hz = readF64(b + 24, false);
-                return d;
-            };
-
-            auto plausible_run_info = [](const RunInfo &c) {
-                // Basic range checks
-                if (!std::isfinite(c.real_time_sec) || !std::isfinite(c.live_time_sec)
-                    || !std::isfinite(c.dead_time_percent) || !std::isfinite(c.count_rate_hz))
-                    return false;
-                if (c.real_time_sec < 0.0 || c.real_time_sec > 86400.0) return false;
-                if (c.live_time_sec < 0.0 || c.live_time_sec > 86400.0) return false;
-                if (c.live_time_sec > c.real_time_sec + 0.001) return false;
-                if (c.dead_time_percent < 0.0 || c.dead_time_percent > 100.0) return false;
-                if (c.count_rate_hz < 0.0 || c.count_rate_hz > 1.0e7) return false;
-
-                // Idle state: all zeros is valid
-                const bool idle = (c.real_time_sec == 0.0 && c.live_time_sec == 0.0
-                                   && c.count_rate_hz == 0.0 && c.dead_time_percent == 0.0);
-                if (idle) return true;
-
-                // Active acquisition checks
-                if (c.real_time_sec < 1.0) return false;
-                if (c.count_rate_hz < 1.0) return false;
-
-                // Live fraction must be reasonable
-                const double lf = c.live_time_sec / c.real_time_sec;
-                if (lf < 0.01 || lf > 1.001) return false;
-
-                // CRITICAL self-consistency check:
-                // dead_time_percent must approximately equal (1 - live/real) * 100
-                const double derived_dead = 100.0 * (1.0 - lf);
-                if (std::fabs(c.dead_time_percent - derived_dead) > 1.0) return false;
-
-                return true;
-            };
-
-            bool found = false;
-            std::vector<char> last_buffer;
-            std::string found_layout;
-
-            // Command 'i' = "Requests Run Information". (Note: 'r' is the
-            // detector's reachback/file-save command — do NOT use it here.)
-            // The response shares the event socket, so when acquisition is
-            // streaming the 28-byte frame may be surrounded by event packets;
-            // we scan offsets and accept the first self-consistent frame. When
-            // queried post-stop (the intended path) the reply arrives clean and
-            // the first offset matches immediately.
-            // While acquisition is streaming, the 'i' reply is buried among event
-            // packets on this shared socket, so a single short read often misses it.
-            // Retry more times, accumulate longer, and scan a larger buffer to raise
-            // the hit-rate under load. Loop breaks immediately once a frame is found,
-            // so a clean (idle/post-stop) reply still returns fast.
-            for (int attempt = 0; attempt < 6 && !found; ++attempt) {
-                const auto deadline = std::chrono::steady_clock::now()
-                                      + std::chrono::milliseconds(2000);
-                auto buffer = sendAndAccumulateRaw(
-                    response_socket, 'i', deadline, 65536);
-
-                const size_t bufsz = buffer.size();
-                for (size_t i = 0; i + 28 <= bufsz && !found; ++i) {
-                    const char *b = buffer.data() + i;
-                    { auto d = decode_A(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "A(28B packed)"; break; } }
-                    if (i + 32 <= bufsz) {
-                        { auto d = decode_B(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "B(32B aligned)"; break; } }
-                        { auto d = decode_C(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "C(32B 4xf64)"; break; } }
-                    }
-                }
-                last_buffer = buffer;
-            }
-
-            if (!found) {
-                std::cerr << "Timed out waiting for valid run info response" << std::endl;
-                if (!last_buffer.empty()) {
-                    const size_t n = std::min<size_t>(last_buffer.size(), 96);
-                    std::ostringstream oss;
-                    oss << std::hex << std::setfill('0');
-                    for (size_t i = 0; i < n; ++i) {
-                        oss << std::setw(2)
-                            << (static_cast<unsigned int>(
-                                static_cast<unsigned char>(last_buffer[i])));
-                    }
-                    std::cerr << "Run info debug: captured " << last_buffer.size()
-                              << " bytes, first " << n << " hex=" << oss.str() << std::endl;
-                }
-                info.real_time_sec = std::numeric_limits<double>::quiet_NaN();
-                info.live_time_sec = std::numeric_limits<double>::quiet_NaN();
-                info.dead_time_percent = std::numeric_limits<double>::quiet_NaN();
-                info.count_rate_hz = std::numeric_limits<double>::quiet_NaN();
-            }
-
-            std::cout << "Run Info [" << (found ? found_layout : "FAIL") << "]: realTime=" << info.real_time_sec << "s, "
-                      << "liveTime=" << info.live_time_sec << "s, "
-                      << "deadTime=" << info.dead_time_percent << "%, "
-                      << "countRate=" << info.count_rate_hz << " Hz" << std::endl;
-
-        } catch (const std::exception &ex) {
-            std::cerr << "Failed to get run info: " << ex.what() << std::endl;
+        // Wait (bounded) for the monitor to parse the reply frame inline.
+        const auto deadline = std::chrono::steady_clock::now()
+                              + std::chrono::milliseconds(1500);
+        bool fresh = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (run_info_seq_.load() != seq_before) { fresh = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
+        if (fresh) {
+            std::lock_guard<std::mutex> lk(run_info_mutex_);
+            info = latest_run_info_;
+        } else {
+            std::cerr << "Run info: no fresh frame within timeout "
+                         "(is an acquisition running?)" << std::endl;
+            info.real_time_sec = std::numeric_limits<double>::quiet_NaN();
+            info.live_time_sec = std::numeric_limits<double>::quiet_NaN();
+            info.dead_time_percent = std::numeric_limits<double>::quiet_NaN();
+            info.count_rate_hz = std::numeric_limits<double>::quiet_NaN();
+        }
+
+        std::cout << "Run Info [" << (fresh ? "inline" : "FAIL") << "]: realTime="
+                  << info.real_time_sec << "s, liveTime=" << info.live_time_sec
+                  << "s, deadTime=" << info.dead_time_percent << "%, countRate="
+                  << info.count_rate_hz << " Hz" << std::endl;
         return info;
     }
 

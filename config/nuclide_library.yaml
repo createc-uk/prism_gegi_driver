@@ -1,0 +1,330 @@
+# Nuclide identification library for the isotope-ID (screening) layer.
+#
+# Used by src/phds_gegi_driver/isotope_id.py: an automatic peak search
+# (Gaussian-derivative matched filter, insensitive to smooth continuum) finds
+# significant peaks in the full spectrum; each nuclide below is then scored by
+# how much of its yield-weighted line set is found. This layer IDENTIFIES what
+# is present ("screening"); it does not quantify - activity comes from the
+# calibrated ROI/Currie assay layer (config/isotopes.yaml + activity node).
+#
+# Modeled on the GeGI ImagerPro ID library categories (SNM / IND / NORM) and
+# the ANSI N42.34-style library of Kim et al., J. Korean Phys. Soc. 87 (2025)
+# 1144 (H3D M400 pHGI), with two deliberate improvements over that paper:
+#   - weighted line scoring instead of strict AND logic (a nuclide is not
+#     rejected just because one weak line is below detection), and
+#   - line detectability folds in the permanent shield-plate transmission,
+#     so low-energy lines (e.g. Am-241 59.5 keV, ~1% through 5 mm steel) do
+#     not count against a nuclide when they CANNOT be seen.
+#
+# Line data: evaluated nuclear data (DDEP/NNDC); energies in keV, yield =
+# emission probability per decay of the EMITTING nuclide. Only lines with
+# yield >~ 3% are listed (plus key SNM lines, which are inherently weak).
+# representative_keV marks the line used for Compton-imaging band selection
+# (highest-yield line that does not collide with another nuclide's line).
+#
+# Add a nuclide by appending an entry - nothing else needs to change.
+
+# Detector energy resolution model: FWHM(E) = sqrt(a*E + b)  [keV], E in keV.
+# MEASURED 2026-09-03 from the calibration run 20260826_134921 (15k channels,
+# tools/identify_isotopes.py --fit-fwhm): least-squares of FWHM^2 = a*E + b on
+# the clean strong lines 122/245/345/662/1174/1334 keV -> ~2.9 keV at 662,
+# ~3.9 keV at 1332 (includes 0.2 keV binning). Supersedes the estimated
+# a=0.0034/b=0.31 (~2x too narrow - model FWHM 1.6 keV at 662 vs measured
+# 2.87). Re-fit after any detector recalibration.
+resolution:
+  a: 0.0104
+  b: 1.57
+
+# Permanent in-beam shielding, used ONLY to weight line detectability during
+# matching (transmission = exp(-mu/rho * rho * t) with the iron mu/rho table
+# built into isotope_id.py). Set thickness_m to 0.0 for a plate-out geometry.
+shielding:
+  material: steel
+  density_g_cm3: 7.87
+  thickness_m: 0.005
+
+nuclides:
+  # ------------------------- Special Nuclear Material -----------------------
+  Am-241:
+    category: SNM
+    representative_keV: 59.54
+    lines:
+      - {energy_keV: 59.54, yield: 0.359}
+    note: >
+      Single usable line at 59.5 keV: ~1% transmission through the permanent
+      5 mm steel plate - effectively blind in the shielded geometry. Screening
+      for Am-241 needs a plate-out measurement.
+
+  U-235:
+    category: SNM
+    representative_keV: 185.72
+    lines:
+      - {energy_keV: 143.76, yield: 0.1096}
+      - {energy_keV: 163.36, yield: 0.0508}
+      - {energy_keV: 185.72, yield: 0.572}
+      - {energy_keV: 205.31, yield: 0.0501}
+    note: >
+      185.7 keV collides with Ra-226 186.2 keV (0.5 keV apart). Disambiguate
+      via the 143.8/163.4/205.3 companions (U-235) versus the Pb-214/Bi-214
+      daughters (Ra-226); the matcher flags the shared peak.
+
+  U-238:
+    category: SNM
+    representative_keV: 1001.03
+    # Lower ID threshold: 1001 keV (Pa-234m) alone is the accepted HPGe
+    # signature - the low-energy Th-234 lines are self-absorbed by the
+    # uranium matrix itself, which the plate-transmission weighting cannot
+    # model, so their absence must not veto the identification.
+    min_score: 0.30
+    lines:
+      # Measured via daughters Th-234 + Pa-234m (secular equilibrium within
+      # months of chemical separation).
+      - {energy_keV: 63.29, yield: 0.037}
+      - {energy_keV: 92.60, yield: 0.055}   # Th-234 92.38+92.80 doublet
+      - {energy_keV: 766.42, yield: 0.00294}
+      - {energy_keV: 1001.03, yield: 0.00842}
+    note: >
+      1001 keV (Pa-234m) is the standard HPGe U-238 line despite its low
+      yield - it penetrates shielding; the 63/93 keV Th-234 lines are heavily
+      plate-attenuated. Long counts needed.
+
+  Pu-239:
+    category: SNM
+    representative_keV: 413.71
+    lines:
+      - {energy_keV: 129.30, yield: 0.0000631}
+      - {energy_keV: 375.05, yield: 0.001554}
+      - {energy_keV: 413.71, yield: 0.001466}
+    note: >
+      All gamma yields are very low; detection requires gram quantities and/or
+      long counts. 375+414 keV pair is the workable HPGe signature.
+
+  Np-237:
+    category: SNM
+    representative_keV: 311.90
+    lines:
+      # 311.9 keV is from the Pa-233 daughter (equilibrium ~ months).
+      - {energy_keV: 86.48, yield: 0.124}
+      - {energy_keV: 311.90, yield: 0.385}
+
+  # ------------------------------ Industrial --------------------------------
+  Co-60:
+    category: IND
+    representative_keV: 1332.49
+    lines:
+      - {energy_keV: 1173.23, yield: 0.9985}
+      - {energy_keV: 1332.49, yield: 0.9998}
+
+  Cs-137:
+    category: IND
+    representative_keV: 661.66
+    lines:
+      - {energy_keV: 661.66, yield: 0.851}
+
+  Cs-134:
+    category: IND
+    representative_keV: 604.72
+    lines:
+      - {energy_keV: 563.25, yield: 0.084}
+      - {energy_keV: 569.33, yield: 0.154}
+      - {energy_keV: 604.72, yield: 0.976}
+      - {energy_keV: 795.86, yield: 0.855}
+      - {energy_keV: 801.95, yield: 0.087}
+
+  Co-57:
+    category: IND
+    representative_keV: 122.06
+    lines:
+      - {energy_keV: 122.06, yield: 0.856}
+      - {energy_keV: 136.47, yield: 0.107}
+
+  Ba-133:
+    category: IND
+    representative_keV: 356.01
+    lines:
+      - {energy_keV: 80.997, yield: 0.329}
+      - {energy_keV: 276.40, yield: 0.072}
+      - {energy_keV: 302.85, yield: 0.183}
+      - {energy_keV: 356.01, yield: 0.621}
+      - {energy_keV: 383.85, yield: 0.089}
+
+  Eu-152:
+    category: IND
+    representative_keV: 1408.01
+    # Compton-imaging band override: image the 964+1086+1112 keV line CLUSTER
+    # (~38% of decays) rather than the single 1408 keV representative line
+    # (21%) - imaging needs events, and one thin band on a weak line makes a
+    # hotspot slow to appear.
+    imaging_keV: 1038.0
+    imaging_window_kev: 80.0
+    lines:
+      - {energy_keV: 121.78, yield: 0.284}
+      - {energy_keV: 244.70, yield: 0.076}
+      - {energy_keV: 344.28, yield: 0.266}
+      # 411/444 keV are below the ~3% curation floor but appear clearly in
+      # real Eu-152 spectra on this detector - listed so they label instead
+      # of surfacing as '?' peaks.
+      - {energy_keV: 411.12, yield: 0.0224}
+      - {energy_keV: 443.96, yield: 0.0283}
+      - {energy_keV: 778.90, yield: 0.130}
+      - {energy_keV: 964.06, yield: 0.145}
+      - {energy_keV: 1085.84, yield: 0.102}
+      - {energy_keV: 1112.07, yield: 0.135}
+      - {energy_keV: 1408.01, yield: 0.209}
+
+  Eu-154:
+    category: IND
+    representative_keV: 1004.73
+    lines:
+      - {energy_keV: 123.07, yield: 0.404}
+      - {energy_keV: 723.30, yield: 0.202}
+      - {energy_keV: 873.18, yield: 0.122}
+      - {energy_keV: 996.26, yield: 0.105}
+      - {energy_keV: 1004.73, yield: 0.179}
+      - {energy_keV: 1274.44, yield: 0.349}
+    note: >
+      1274.4 keV collides with Na-22 1274.5 - representative line is 1004.7
+      (same choice as the pHGI paper).
+
+  Na-22:
+    category: IND
+    representative_keV: 1274.54
+    lines:
+      - {energy_keV: 511.00, yield: 1.798, annihilation: true}
+      - {energy_keV: 1274.54, yield: 0.999}
+
+  Mn-54:
+    category: IND
+    representative_keV: 834.85
+    lines:
+      - {energy_keV: 834.85, yield: 0.9998}
+
+  Zn-65:
+    category: IND
+    representative_keV: 1115.54
+    lines:
+      - {energy_keV: 1115.54, yield: 0.506}
+
+  Ir-192:
+    category: IND
+    representative_keV: 468.07
+    lines:
+      - {energy_keV: 295.96, yield: 0.287}
+      - {energy_keV: 308.46, yield: 0.297}
+      - {energy_keV: 316.51, yield: 0.828}
+      - {energy_keV: 468.07, yield: 0.478}
+      - {energy_keV: 604.41, yield: 0.082}
+
+  Sb-124:
+    category: IND
+    representative_keV: 1690.97
+    lines:
+      - {energy_keV: 602.73, yield: 0.979}
+      - {energy_keV: 722.78, yield: 0.108}
+      - {energy_keV: 1690.97, yield: 0.474}
+
+  Ta-182:
+    category: IND
+    representative_keV: 1221.40
+    lines:
+      - {energy_keV: 1121.29, yield: 0.353}
+      - {energy_keV: 1189.05, yield: 0.165}
+      - {energy_keV: 1221.40, yield: 0.272}
+      - {energy_keV: 1231.00, yield: 0.116}
+
+  Y-88:
+    category: IND
+    representative_keV: 1836.06
+    lines:
+      - {energy_keV: 898.04, yield: 0.937}
+      - {energy_keV: 1836.06, yield: 0.992}
+
+  Nb-95:
+    category: IND
+    representative_keV: 765.80
+    lines:
+      - {energy_keV: 765.80, yield: 0.998}
+
+  La-140:
+    category: IND
+    representative_keV: 1596.21
+    lines:
+      - {energy_keV: 487.02, yield: 0.455}
+      - {energy_keV: 815.77, yield: 0.233}
+      - {energy_keV: 1596.21, yield: 0.954}
+
+  Ce-144:
+    category: IND
+    representative_keV: 133.51
+    lines:
+      - {energy_keV: 133.51, yield: 0.111}
+    note: Single low-energy line; plate attenuation makes this insensitive.
+
+  # --------------------- Naturally Occurring (NORM) -------------------------
+  K-40:
+    category: NORM
+    representative_keV: 1460.82
+    lines:
+      - {energy_keV: 1460.82, yield: 0.1066}
+
+  Ra-226:
+    category: NORM
+    representative_keV: 186.21
+    lines:
+      - {energy_keV: 186.21, yield: 0.0364}
+    note: >
+      Collides with U-235 185.7 keV. Real Ra-226 is normally confirmed by its
+      daughters Pb-214/Bi-214 (present in equilibrium); the matcher flags the
+      shared peak so the operator checks the daughters. BACKSCATTER TRAP: any
+      strong source produces a backscatter bump at ~184-200 keV (662 keV
+      backscatters to 184 keV) that can mimic this line - treat a 186 keV
+      "Ra-226" seen ONLY alongside a strong Cs/Co source as suspect unless
+      the Pb-214/Bi-214 daughters are also present.
+
+  Pb-214:
+    category: NORM
+    representative_keV: 351.93
+    lines:
+      - {energy_keV: 242.00, yield: 0.0743}
+      - {energy_keV: 295.22, yield: 0.185}
+      - {energy_keV: 351.93, yield: 0.356}
+
+  Bi-214:
+    category: NORM
+    representative_keV: 609.31
+    lines:
+      - {energy_keV: 609.31, yield: 0.454}
+      - {energy_keV: 1120.29, yield: 0.149}
+      - {energy_keV: 1238.11, yield: 0.058}
+      - {energy_keV: 1764.49, yield: 0.153}
+      - {energy_keV: 2204.21, yield: 0.049}
+
+  Pb-212:
+    category: NORM
+    representative_keV: 238.63
+    lines:
+      - {energy_keV: 238.63, yield: 0.436}
+
+  Bi-212:
+    category: NORM
+    representative_keV: 727.33
+    lines:
+      - {energy_keV: 727.33, yield: 0.0674}
+
+  Tl-208:
+    category: NORM
+    representative_keV: 2614.51
+    lines:
+      # Yields per Tl-208 decay; in a Th-232 chain in equilibrium the whole
+      # nuclide is fed by the 35.9% Bi-212 alpha branch.
+      - {energy_keV: 583.19, yield: 0.851}
+      - {energy_keV: 860.56, yield: 0.126}
+      - {energy_keV: 2614.51, yield: 0.998}
+
+  Ac-228:
+    category: NORM
+    representative_keV: 911.20
+    lines:
+      - {energy_keV: 338.32, yield: 0.113}
+      - {energy_keV: 911.20, yield: 0.258}
+      - {energy_keV: 968.97, yield: 0.158}

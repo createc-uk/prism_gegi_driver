@@ -12,6 +12,7 @@
 #include <algorithm> // copy
 #include <array> // array
 #include <atomic> // atomic
+#include <cstdint> // uint64_t
 #include <functional> // function, placeholders
 #include <iostream> // cerr, cout, endl
 #include <iterator> // begin, end
@@ -51,6 +52,16 @@ namespace phds_gegi_driver::socket_comms {
         void connect(const std::string &ip, const std::string &port);
         void startListening();
 
+        // Energy-scale correction applied to every parsed site energy:
+        //   E_true = c0 + c1*E + c2*E^2   (default identity).
+        // The detector's onboard event-energy calibration reads slightly high
+        // at the top of the range (~+1 keV at 1332 keV, fit 2026-08-26 from a
+        // 10-line Cs/Co/Eu run, tools/fit_energy_cal.py). Correcting HERE -
+        // the single point where energies enter - means the spectrum, ROIs,
+        // imaging bands, isotope-ID and recorded bags all inherit it.
+        // Call before startListening() (read by the monitor thread).
+        void setEnergyCorrection(double c0, double c1, double c2);
+
         // Remote control commands (single-byte ASCII)
         bool sendStartAcquisition();    // 'g'
         bool sendStopAcquisition();     // 's'
@@ -70,6 +81,13 @@ namespace phds_gegi_driver::socket_comms {
         void monitorSocket();
         bool sendCommand(char cmd);  // Low-level send
 
+        double correctEnergy(double e_kev) const {
+            return ecal_c0_ + ecal_c1_ * e_kev + ecal_c2_ * e_kev * e_kev;
+        }
+        double ecal_c0_ = 0.0;
+        double ecal_c1_ = 1.0;
+        double ecal_c2_ = 0.0;
+
         boost::asio::io_service io_service_;
 
         Callback1Site callback_1_site_;
@@ -87,6 +105,15 @@ namespace phds_gegi_driver::socket_comms {
         std::mutex response_mutex_;   // Held during command response reads; monitorSocket waits on this
 
         std::atomic<bool> running_ {false};
+
+        // Latest run-info frame, parsed INLINE by the monitor thread (the sole
+        // socket reader) as frames stream past in reply to 'i'. getRunInfo()
+        // returns this cached value instead of doing its own competing read, so a
+        // status query never races the event stream or discards event data.
+        RunInfo latest_run_info_;
+        std::mutex run_info_mutex_;
+        std::atomic<bool> have_run_info_ {false};
+        std::atomic<std::uint64_t> run_info_seq_ {0};  // bumped on each inline parse
 
         static constexpr int PACKET_SIZE_BYTES_ = 92;  // Legacy: max packet size (Compton events)
     };

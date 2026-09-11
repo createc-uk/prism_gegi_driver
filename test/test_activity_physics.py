@@ -123,6 +123,44 @@ class TestShielding(unittest.TestCase):
                         an.shield_transmission(mu, n, thickness),
                         math.exp(-mu * n * thickness), delta=1e-12)
 
+    # --- measured per-plate-count transmission table (broad-beam build-up) ---
+
+    TABLE = {1: 0.8141, 2: 0.7178}   # Co-60 1173 keV, measured 2026-09-04
+
+    def test_tabulated_plate_count_uses_exact_measured_value(self):
+        self.assertEqual(
+            an.shield_transmission(34.8, 1, PLATE_T, self.TABLE), 0.8141)
+        self.assertEqual(
+            an.shield_transmission(34.8, 2, PLATE_T, self.TABLE), 0.7178)
+
+    def test_zero_plates_is_unity_even_with_table(self):
+        self.assertEqual(
+            an.shield_transmission(34.8, 0, PLATE_T, self.TABLE), 1.0)
+
+    def test_beyond_table_extrapolates_from_highest_tabulated(self):
+        # 3 plates = measured T(2) * one exponential plate
+        expected = 0.7178 * math.exp(-34.8 * PLATE_T)
+        self.assertAlmostEqual(
+            an.shield_transmission(34.8, 3, PLATE_T, self.TABLE),
+            expected, delta=1e-12)
+
+    def test_gap_below_table_extrapolates_from_lower_entry(self):
+        # table has only n=1: n=2 = T(1) * one exponential plate
+        expected = 0.8141 * math.exp(-34.8 * PLATE_T)
+        self.assertAlmostEqual(
+            an.shield_transmission(34.8, 2, PLATE_T, {1: 0.8141}),
+            expected, delta=1e-12)
+
+    def test_empty_or_none_table_falls_back_to_exponential(self):
+        for table in (None, {}):
+            self.assertAlmostEqual(
+                an.shield_transmission(41.8, 2, PLATE_T, table),
+                math.exp(-41.8 * 2 * PLATE_T), delta=1e-12)
+
+    def test_string_keys_from_yaml_are_accepted(self):
+        self.assertEqual(
+            an.shield_transmission(34.8, 2, PLATE_T, {'2': 0.7178}), 0.7178)
+
 
 class TestPlateDerivedDistance(unittest.TestCase):
     """distance = base_standoff + total_plates * thickness."""
@@ -220,6 +258,196 @@ class TestIsotopeConfig(unittest.TestCase):
         ic = self._make(_cs137_cfg())
         self.assertLess(ic.left_channels[-1], ic.peak_channels[0])
         self.assertGreater(ic.right_channels[0], ic.peak_channels[-1])
+
+
+class TestOffAxisSolidAngle(unittest.TestCase):
+    """Position-aware correction: ratio = (d0/d')^exponent.
+
+    d' = sqrt(d0^2 + rho^2) is the slant distance to a source displaced rho
+    laterally. Default exponent 2.0 = inverse-square only, the MEASURED model
+    for the GeGI (corner proof 2026-09-03: publishing the slant distance
+    recovered the Co-60 cert to +1.6% - flat-disk foreshortening is cancelled
+    by the oblique 11-mm crystal chord). exponent 3.0 = naive flat-disk.
+    """
+
+    D0 = 0.580     # operational standoff (m)
+    RHO = 0.250    # tray-corner lateral offset (m)
+
+    def test_on_axis_is_unity(self):
+        self.assertEqual(an.off_axis_solid_angle_ratio(self.D0, 0.0), 1.0)
+
+    def test_degenerate_inputs_are_unity(self):
+        self.assertEqual(an.off_axis_solid_angle_ratio(0.0, self.RHO), 1.0)
+        self.assertEqual(an.off_axis_solid_angle_ratio(-1.0, self.RHO), 1.0)
+        self.assertEqual(an.off_axis_solid_angle_ratio(self.D0, -0.1), 1.0)
+
+    def test_default_is_inverse_square(self):
+        # d' = sqrt(0.58^2 + 0.25^2) = 0.6315853 m -> (0.58/0.6315853)^2
+        d_slant = math.sqrt(self.D0 ** 2 + self.RHO ** 2)
+        expected = (self.D0 / d_slant) ** 2
+        self.assertAlmostEqual(
+            an.off_axis_solid_angle_ratio(self.D0, self.RHO), expected,
+            delta=1e-12)
+        # ~ -16% inverse-square deficit at the corner
+        self.assertAlmostEqual(expected, 0.8433, delta=5e-4)
+
+    def test_default_equals_solid_angle_ratio_far_field(self):
+        """exponent 2 == the actual Omega(d')/Omega(d0) ratio (far field)."""
+        d_slant = math.sqrt(self.D0 ** 2 + self.RHO ** 2)
+        omega_ratio = (an.gegi_solid_angle_fraction(d_slant, R)
+                       / an.gegi_solid_angle_fraction(self.D0, R))
+        self.assertAlmostEqual(
+            an.off_axis_solid_angle_ratio(self.D0, self.RHO), omega_ratio,
+            delta=2e-3)
+
+    def test_flat_disk_exponent_adds_foreshortening(self):
+        d_slant = math.sqrt(self.D0 ** 2 + self.RHO ** 2)
+        cos_theta = self.D0 / d_slant
+        self.assertAlmostEqual(
+            an.off_axis_solid_angle_ratio(self.D0, self.RHO, exponent=3.0),
+            cos_theta * (self.D0 / d_slant) ** 2, delta=1e-12)
+        # naive flat-disk predicts ~ -23% at the corner
+        self.assertAlmostEqual(
+            an.off_axis_solid_angle_ratio(self.D0, self.RHO, exponent=3.0),
+            0.7745, delta=5e-4)
+
+    def test_monotonically_decreasing_with_offset(self):
+        for exponent in (2.0, 3.0):
+            vals = [an.off_axis_solid_angle_ratio(self.D0, rho, exponent)
+                    for rho in (0.05, 0.10, 0.20, 0.30, 0.50)]
+            for near, far in zip(vals, vals[1:]):
+                self.assertGreater(near, far)
+            for v in vals:
+                self.assertGreater(v, 0.0)
+                self.assertLess(v, 1.0)
+
+
+class TestSlantShieldFactor(unittest.TestCase):
+    """Extra transmission for the slant path through the plates:
+    exp(-mu * n * t * (1/cos(theta) - 1)); the on-axis part is applied
+    separately by shield_transmission."""
+
+    D0 = 0.580
+    RHO = 0.250
+
+    def test_on_axis_is_unity(self):
+        self.assertEqual(
+            an.slant_shield_factor(41.8, 2, PLATE_T, self.D0, 0.0), 1.0)
+
+    def test_no_plates_is_unity(self):
+        self.assertEqual(
+            an.slant_shield_factor(41.8, 0, PLATE_T, self.D0, self.RHO), 1.0)
+
+    def test_no_mu_is_unity(self):
+        self.assertEqual(
+            an.slant_shield_factor(0.0, 2, PLATE_T, self.D0, self.RHO), 1.0)
+
+    def test_corner_value_one_plate_1173(self):
+        cos_theta = self.D0 / math.sqrt(self.D0 ** 2 + self.RHO ** 2)
+        expected = math.exp(-41.8 * 1 * PLATE_T * (1.0 / cos_theta - 1.0))
+        got = an.slant_shield_factor(41.8, 1, PLATE_T, self.D0, self.RHO)
+        self.assertAlmostEqual(got, expected, delta=1e-12)
+        # small effect: ~ -1.9% for one extra plate at the corner
+        self.assertGreater(got, 0.97)
+        self.assertLess(got, 1.0)
+
+    def test_total_slant_transmission_equals_full_slant_path(self):
+        """on-axis transmission x slant factor == exp(-mu * n * t / cos)."""
+        cos_theta = self.D0 / math.sqrt(self.D0 ** 2 + self.RHO ** 2)
+        for n in (1, 2, 3):
+            combined = (an.shield_transmission(41.8, n, PLATE_T)
+                        * an.slant_shield_factor(41.8, n, PLATE_T,
+                                                 self.D0, self.RHO))
+            self.assertAlmostEqual(
+                combined, math.exp(-41.8 * n * PLATE_T / cos_theta),
+                delta=1e-12)
+
+
+class TestNuclideNameMatching(unittest.TestCase):
+    """Assay isotope names must match the imaging hotspot labels."""
+
+    def test_assay_lines_match_hotspot_labels(self):
+        self.assertEqual(an.normalize_nuclide_name('Cs137'),
+                         an.normalize_nuclide_name('Cs-137'))
+        self.assertEqual(an.normalize_nuclide_name('Co60_1173'),
+                         an.normalize_nuclide_name('Co-60'))
+        self.assertEqual(an.normalize_nuclide_name('Co60_1332'),
+                         an.normalize_nuclide_name('Co-60'))
+
+    def test_both_co60_lines_share_one_key(self):
+        self.assertEqual(an.normalize_nuclide_name('Co60_1173'),
+                         an.normalize_nuclide_name('Co60_1332'))
+
+    def test_distinct_nuclides_stay_distinct(self):
+        keys = {an.normalize_nuclide_name(n)
+                for n in ('Cs-137', 'Co-60', 'Eu-152', 'Am-241')}
+        self.assertEqual(len(keys), 4)
+
+
+class TestParseHotspots(unittest.TestCase):
+    """'/source_isotopes' + '/source_directions' pairing."""
+
+    def test_typical_two_source_frame(self):
+        hs = an.parse_hotspots('Cs-137:142|Co-60:98',
+                               [(0.10, -0.05), (0.0, 0.20)])
+        self.assertEqual(set(hs.keys()), {'cs137', 'co60'})
+        self.assertAlmostEqual(hs['cs137']['offset_m'],
+                               math.sqrt(0.10 ** 2 + 0.05 ** 2), delta=1e-12)
+        self.assertAlmostEqual(hs['co60']['offset_m'], 0.20, delta=1e-12)
+        self.assertEqual(hs['cs137']['count'], 142)
+
+    def test_none_and_empty_yield_no_hotspots(self):
+        self.assertEqual(an.parse_hotspots('none', []), {})
+        self.assertEqual(an.parse_hotspots('', []), {})
+
+    def test_duplicate_nuclide_keeps_dominant_hotspot(self):
+        # same nuclide imaged at two positions: the higher-count one wins
+        hs = an.parse_hotspots('Co-60:40|Co-60:90',
+                               [(0.30, 0.0), (0.05, 0.0)])
+        self.assertEqual(len(hs), 1)
+        self.assertEqual(hs['co60']['count'], 90)
+        self.assertAlmostEqual(hs['co60']['offset_m'], 0.05, delta=1e-12)
+
+    def test_assay_line_lookup_finds_its_hotspot(self):
+        hs = an.parse_hotspots('Co-60:98', [(0.15, -0.20)])
+        self.assertIn(an.normalize_nuclide_name('Co60_1332'), hs)
+
+
+class TestAverageHotspot(unittest.TestCase):
+    """Window-averaged hotspot position (damps per-frame imaging jitter)."""
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(an.average_hotspot([]))
+
+    def test_single_sample_passes_through(self):
+        avg = an.average_hotspot([{'y_m': 0.18, 'z_m': 0.20}])
+        self.assertAlmostEqual(avg['y_m'], 0.18, delta=1e-12)
+        self.assertAlmostEqual(avg['z_m'], 0.20, delta=1e-12)
+        self.assertAlmostEqual(avg['offset_m'],
+                               math.sqrt(0.18 ** 2 + 0.20 ** 2), delta=1e-12)
+        self.assertEqual(avg['n_samples'], 1)
+
+    def test_vector_mean_of_jittered_samples(self):
+        # symmetric jitter around (0.17, 0.17) must average back to it
+        samples = [{'y_m': 0.17 + dy, 'z_m': 0.17 + dz}
+                   for (dy, dz) in ((0.03, 0.0), (-0.03, 0.0),
+                                    (0.0, 0.03), (0.0, -0.03))]
+        avg = an.average_hotspot(samples)
+        self.assertAlmostEqual(avg['y_m'], 0.17, delta=1e-12)
+        self.assertAlmostEqual(avg['z_m'], 0.17, delta=1e-12)
+        self.assertAlmostEqual(avg['offset_m'], 0.17 * math.sqrt(2.0),
+                               delta=1e-12)
+        self.assertEqual(avg['n_samples'], 4)
+
+    def test_vector_mean_beats_scalar_mean_of_offsets(self):
+        """Averaging |offset| carries a positive noise bias the vector mean
+        does not: for symmetric jitter, mean(|r_i|) > |mean(r_i)|."""
+        samples = [{'y_m': 0.17 + dy, 'z_m': 0.17 + dz}
+                   for (dy, dz) in ((0.05, 0.0), (-0.05, 0.0),
+                                    (0.0, 0.05), (0.0, -0.05))]
+        scalar_mean = sum(math.sqrt(s['y_m'] ** 2 + s['z_m'] ** 2)
+                          for s in samples) / 4.0
+        self.assertLess(an.average_hotspot(samples)['offset_m'], scalar_mean)
 
 
 class TestIntrinsicEfficiencyPolynomial(unittest.TestCase):

@@ -5,12 +5,15 @@ Live Spectrum Plotter - Runs natively on Windows (or any machine) via Prism.
 Connects directly to the Prism messaging backend (NATS by default, same as
 the C++ driver and the Python processing nodes) and subscribes to the
 spectrum, singles-spectrum, and activity-results topics. Displays a
-real-time matplotlib energy histogram.
+real-time matplotlib energy histogram, with optional live peak labels.
 
 Prerequisites:
   - The Prism Python bindings must be built and installed (see project
     README) -- this replaces the old `pip install roslibpy` requirement.
   - matplotlib, numpy
+  - Peak labels (optional): a nuclide_library.yaml (see --library, default
+    config/nuclide_library.yaml). The plotter runs without labels if the
+    library is missing or fails to load.
 
 Usage:
   python plot_live_spectrum.py --protocol nats --server localhost --port 4222
@@ -20,6 +23,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -32,9 +36,18 @@ import prism
 
 import prism_messages as pmsg
 
+# Isotope-ID screening engine (matched-filter peak search + library match):
+# used to LABEL identified peaks on the live spectrum. Optional -- the
+# plotter runs without labels if the module/library is unavailable.
+try:
+    import isotope_id
+except ImportError:
+    isotope_id = None
+
 
 class LiveSpectrumPlotter(object):
-    def __init__(self, app, result, connection, topic, cal_path, cumulative):
+    def __init__(self, app, result, connection, topic, cal_path, cumulative,
+                 library_path=""):
         self.cumulative = cumulative
         self.bin_edges = self._load_cal(cal_path)
         self.n_bins = len(self.bin_edges)
@@ -44,6 +57,29 @@ class LiveSpectrumPlotter(object):
         self.singles_lock = threading.Lock()
         self.new_data = False
         self.new_singles_data = False
+
+        # Nuclide library for live peak labels (optional). Unlike the
+        # upstream ROS driver's plotter, this always identifies peaks LOCALLY
+        # from this tool's own display buffer, rather than preferring a
+        # pipeline-published /identified_lines summary: this fork's
+        # equivalent topic (gegi.data_recorder.identified, see
+        # data_recorder_node.py) is a compact "Nuclide:score" text list for
+        # heatmap gating, not the richer per-line energy/tags/persistence
+        # payload the pipeline-preferred labeling path needs. Local
+        # identification finds its own peak positions on the SAME buffer this
+        # tool is already displaying, so it is effectively the same
+        # information upstream's "pipeline quiet" fallback path used.
+        self.library = None
+        if isotope_id is not None and library_path and \
+                os.path.exists(library_path):
+            try:
+                self.library = isotope_id.load_nuclide_library(library_path)
+                print("Peak labels: %d-nuclide ID library loaded"
+                      % len(self.library['nuclides']))
+            except Exception as e:
+                print("Peak labels disabled (library load failed: %s)" % e)
+        self.peak_artists = []
+        self._last_id_time = 0.0
 
         # Activity results state
         self.activity_lock = threading.Lock()
@@ -110,6 +146,71 @@ class LiveSpectrumPlotter(object):
                 self.activity_results = data
         except (ValueError, TypeError):
             pass
+
+    def _draw_labels(self, ax, data, entries):
+        """(Re)draw peak labels: entries = [(energy_keV, text)]."""
+        for art in self.peak_artists:
+            try:
+                art.remove()
+            except ValueError:
+                pass
+        self.peak_artists = []
+        ymax = max(float(data.max()), 1.0)
+        for energy, name in sorted(entries):
+            idx = int(np.searchsorted(self.bin_edges, energy)) - 1
+            lo, hi = max(0, idx - 5), min(len(data), idx + 6)
+            height = float(data[lo:hi].max()) if hi > lo else 0.0
+            art = ax.annotate(
+                "{} ({:.0f})".format(name, energy),
+                xy=(energy, height), xytext=(energy, height + 0.03 * ymax),
+                rotation=90, fontsize=8, ha='center', va='bottom',
+                color='crimson',
+                bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                          edgecolor='crimson', alpha=0.75))
+            self.peak_artists.append(art)
+
+    @staticmethod
+    def _format_label(line):
+        """Display text for one labelled line. Decorations:
+          'Co-57?'   contested - an unidentified nuclide also fits the peak
+          '~Eu-152'  unknown peak, but this nuclide WOULD fit (candidate hint)
+          '*'        backscatter-suspect region
+          'annih.'   unmatched 511 keV
+        """
+        text = line.get('label', '?')
+        tags = line.get('tags', [])
+        if text == '?':
+            cand = next((t.split(':', 1)[1] for t in tags
+                         if t.startswith('candidates:')), None)
+            if cand:
+                text = '~' + cand
+            elif 'annihilation' in tags:
+                text = 'annih.'
+        if 'backscatter-suspect' in tags:
+            text += '*'
+        return text
+
+    def _relabel_peaks(self, ax, data):
+        """Identify peaks in the CURRENT display buffer and label them.
+
+        Rebin toward ~0.8 keV so the matched filter is fast in the GUI loop.
+        This mirrors the upstream ROS driver's plotter's fallback path (local
+        identification), used here unconditionally -- see the __init__
+        docstring note on why this fork does not have a richer pipeline
+        /identified_lines-equivalent topic to prefer instead.
+        """
+        bin_w = float(np.median(np.diff(self.bin_edges))) or 1.0
+        factor = max(1, int(round(0.8 / bin_w)))
+        centers = self.bin_edges + bin_w / 2.0
+        m = (len(data) // factor) * factor
+        counts = data[:m].reshape(-1, factor).sum(axis=1).copy()
+        cents = centers[:m].reshape(-1, factor).mean(axis=1)
+        counts[-1] = 0.0     # overflow bin guard
+
+        peaks, results, _ = isotope_id.identify(counts, cents, self.library)
+        labeled = isotope_id.label_peaks(peaks, results)
+        entries = [(l['energy_keV'], self._format_label(l)) for l in labeled]
+        self._draw_labels(ax, data, entries)
 
     def run(self):
         print("Connected. Waiting for spectrum data...")
@@ -242,6 +343,15 @@ class LiveSpectrumPlotter(object):
                 ax_cum.set_title("All Events Spectrum | Total: {} counts".format(
                     int(data_cum.sum())))
 
+                # Periodically (re)label peaks on the cumulative buffer.
+                if self.library is not None and data_cum.sum() > 500 and \
+                        time.time() - self._last_id_time > 10.0:
+                    self._last_id_time = time.time()
+                    try:
+                        self._relabel_peaks(ax_cum, data_cum)
+                    except Exception as e:
+                        print("peak labelling failed: %s" % e)
+
             # Update singles bars
             if data_singles is not None:
                 for bar, h in zip(bars_snap, data_singles):
@@ -275,6 +385,8 @@ def main():
     app.add_string_option("PlotLiveSpectrum", "cal", "Path to EnergyCal.csv", "")
     app.add_bool_option("PlotLiveSpectrum", "cumulative",
                          "Accumulate counts over time (default: show latest snapshot)")
+    app.add_string_option("PlotLiveSpectrum", "library",
+                          "nuclide_library.yaml for live peak labels (default: config/nuclide_library.yaml)", "")
 
     result = app.parse()
     if result is None:
@@ -284,6 +396,7 @@ def main():
     topic = result.get_string("topic")
     cal = result.get_string("cal")
     cumulative = result.get_bool("cumulative")
+    library = result.get_string("library")
 
     if not cal:
         default = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -291,12 +404,19 @@ def main():
         if os.path.exists(default):
             cal = default
 
+    if not library:
+        default_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "config", "nuclide_library.yaml")
+        if os.path.exists(default_lib):
+            library = default_lib
+
     connection = app.create_connection(result)
     if connection is None:
         print("Could not connect to messaging backend - is the server running?")
         sys.exit(1)
 
-    plotter = LiveSpectrumPlotter(app, result, connection, topic, cal, cumulative)
+    plotter = LiveSpectrumPlotter(app, result, connection, topic, cal, cumulative,
+                                  library_path=library)
     plotter.run()
     plotter.stop()
     connection.close()

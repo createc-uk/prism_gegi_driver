@@ -29,7 +29,13 @@ int main(int argc, char *argv[]) {
             ("idle-poll-interval-sec", "run_info/detector_info republish interval while idle (s)",
              cxxopts::value<double>()->default_value("2.0"))
             ("busy-poll-interval-sec", "run_info/detector_info republish interval while acquisition is active (s)",
-             cxxopts::value<double>()->default_value("30.0"));
+             cxxopts::value<double>()->default_value("30.0"))
+            ("energy-cal-c0", "Energy calibration correction c0 (keV): corrected = c0 + c1*E + c2*E^2",
+             cxxopts::value<double>()->default_value("0.0"))
+            ("energy-cal-c1", "Energy calibration correction c1 (unitless gain term)",
+             cxxopts::value<double>()->default_value("1.0"))
+            ("energy-cal-c2", "Energy calibration correction c2 (1/keV, quadratic term)",
+             cxxopts::value<double>()->default_value("0.0"));
 
         auto result = app.parse();
         if (!result) return 1;

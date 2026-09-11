@@ -1,5 +1,15 @@
 # Prism endpoint overrides for the C++ multi-endpoint GeGi driver.
 # Endpoint IDs and defaults mirror PhdsGegiDriver's compiled configuration.
+# Energy-scale correction applied to every parsed site energy (keV) before
+# any downstream consumer (spectrum, activity, heatmap, isotope-ID, recorded
+# bags) sees it: corrected = c0 + c1*E + c2*E^2. Defaults 0.0/1.0/0.0 = no
+# correction. Read via psm::utils::Configuration::get() (the same top-level
+# flattened-key mechanism used for connection/endpoint params); --energy-cal-c0
+# /c1/c2 CLI flags take precedence over these.
+energy_cal_c0: 0.0
+energy_cal_c1: 1.0
+energy_cal_c2: 0.0
+
 endpoints:
   compton_event:
     name: gegi.driver.compton_event

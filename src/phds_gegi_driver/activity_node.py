@@ -46,6 +46,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import collections
 import json
 import math
 import threading
@@ -70,6 +71,9 @@ RESULTS_TOPIC = "gegi.activity.results"
 EFFECTIVE_SOURCE_DISTANCE_TOPIC = "gegi.activity.effective_source_distance"
 SOURCE_DISTANCE_TOPIC = "gegi.activity.source_distance"
 N_SHIELDING_PLATES_TOPIC = "gegi.activity.n_shielding_plates"
+# Imaging hotspots (published by spherical_heatmap_node); only subscribed to
+# when ~position_correction is enabled.
+SOURCE_DIRECTIONS_TOPIC = "gegi.heatmap.source_directions"
 
 # Republish the effective source distance at this interval so late-joining
 # subscribers converge quickly. ROS latched topics had no wait-for-subscriber
@@ -100,13 +104,27 @@ def gegi_solid_angle_fraction(distance_m, crystal_radius_m=GEGI_CRYSTAL_RADIUS_M
     return 0.5 * (1.0 - distance_m / math.sqrt(d2 + r2))
 
 
-def shield_transmission(mu_shield_per_m, total_plates, plate_thickness_m):
+def shield_transmission(mu_shield_per_m, total_plates, plate_thickness_m, plate_transmission=None):
     """Fraction of gammas transmitted through `total_plates` shielding plates.
 
     transmission = exp(-mu * total_plates * plate_thickness). Returns 1.0 (no
     attenuation) when there is no shielding or no attenuation coefficient.
     Pure function so the shielding physics is unit-testable.
     """
+    if total_plates <= 0:
+        return 1.0
+    if plate_transmission:
+        table = {int(k): float(v) for k, v in plate_transmission.items()
+                 if float(v) > 0.0}
+        if total_plates in table:
+            return table[total_plates]
+        lower = [n for n in table if 0 < n < total_plates]
+        if lower:
+            n0 = max(lower)
+            extra_m = (total_plates - n0) * plate_thickness_m
+            if extra_m > 0 and mu_shield_per_m > 0:
+                return table[n0] * math.exp(-mu_shield_per_m * extra_m)
+            return table[n0]
     total_thickness = total_plates * plate_thickness_m
     if total_thickness <= 0 or mu_shield_per_m <= 0:
         return 1.0
@@ -119,6 +137,115 @@ def plate_derived_distance(base_standoff_m, total_plates, plate_thickness_m):
     Each plate displaces the source by its thickness from the bare standoff.
     """
     return base_standoff_m + total_plates * plate_thickness_m
+
+
+def off_axis_solid_angle_ratio(on_axis_distance_m, lateral_offset_m, exponent=2.0):
+    """Efficiency ratio (off-axis)/(on-axis) for a source displaced laterally
+    by rho from the detector axis at perpendicular standoff d0:
+
+        ratio = (d0 / d')^exponent,   d' = sqrt(d0^2 + rho^2)
+
+    exponent selects the detector-response model:
+      2.0 (DEFAULT) - inverse-square only. Measured best model for the GeGI:
+          publishing the slant distance alone recovered a corner Co-60
+          certificate to +1.6% (within counting statistics), i.e. the
+          flat-disk foreshortening (cos theta) is cancelled by the longer
+          oblique chord through the 11-mm planar crystal.
+      3.0 - naive far-field flat-disk (cos theta foreshortening included, no
+          chord compensation); over-corrects a corner by ~15%.
+    Returns 1.0 on-axis or for degenerate input. Pure function (unit-tested).
+    """
+    if on_axis_distance_m <= 0 or lateral_offset_m <= 0:
+        return 1.0
+    d_slant = math.sqrt(on_axis_distance_m ** 2 + lateral_offset_m ** 2)
+    return (on_axis_distance_m / d_slant) ** exponent
+
+
+def slant_shield_factor(mu_shield_per_m, total_plates, plate_thickness_m,
+                        on_axis_distance_m, lateral_offset_m):
+    """EXTRA shield transmission from the slant path through the plates.
+
+    An off-axis ray crosses each plate at angle theta to the normal, so the
+    steel path grows from t to t/cos(theta). The on-axis transmission is
+    already corrected elsewhere (shield_transmission); this returns only the
+    additional factor exp(-mu * n * t * (1/cos(theta) - 1)).
+    Returns 1.0 on-axis or with no plates / no attenuation coefficient.
+    """
+    if on_axis_distance_m <= 0 or lateral_offset_m <= 0:
+        return 1.0
+    d_slant = math.sqrt(on_axis_distance_m ** 2 + lateral_offset_m ** 2)
+    cos_theta = on_axis_distance_m / d_slant
+    extra_path_m = total_plates * plate_thickness_m * (1.0 / cos_theta - 1.0)
+    if extra_path_m <= 0 or mu_shield_per_m <= 0:
+        return 1.0
+    return math.exp(-mu_shield_per_m * extra_path_m)
+
+
+def normalize_nuclide_name(name):
+    """Canonical key for matching assay isotope names to imaging hotspot labels.
+
+    'Cs-137' and 'Cs137' -> 'cs137'; 'Co60_1173', 'Co60_1332' and 'Co-60' all
+    -> 'co60' (the assay-line energy suffix after '_' is dropped, so both
+    Co-60 photopeaks match the single imaged Co-60 hotspot).
+    """
+    base = str(name).split('_')[0]
+    return ''.join(ch for ch in base if ch.isalnum()).lower()
+
+
+def parse_hotspots(isotope_labels, yz_offsets_m):
+    """Pair the heatmap node's index-aligned outputs into per-nuclide hotspots.
+
+    isotope_labels: pipe-separated 'Name:count' labels, e.g.
+                    'Cs-137:142|Co-60:98' ('none' or '' = no hotspots).
+    yz_offsets_m:   [(y, z), ...] source-plane offsets in metres, same order.
+
+    Returns {normalized_name: {'name', 'count', 'y_m', 'z_m', 'offset_m'}},
+    keeping the highest-count hotspot per nuclide - when the same nuclide
+    images at several positions the dominant source drives the correction.
+    Pure function (unit-tested); zip() truncates a length mismatch, callers
+    should reject mismatched pairs before calling.
+    """
+    out = {}
+    if not isotope_labels or isotope_labels == 'none':
+        return out
+    for label, yz in zip(isotope_labels.split('|'), yz_offsets_m):
+        parts = label.rsplit(':', 1)
+        name = parts[0].strip()
+        if not name:
+            continue
+        try:
+            count = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            count = 0
+        y = float(yz[0])
+        z = float(yz[1])
+        entry = {'name': name, 'count': count, 'y_m': y, 'z_m': z,
+                 'offset_m': math.sqrt(y * y + z * z)}
+        key = normalize_nuclide_name(name)
+        if key not in out or count > out[key]['count']:
+            out[key] = entry
+    return out
+
+
+def average_hotspot(entries):
+    """Vector-mean position of one nuclide's hotspot samples.
+
+    entries: list of hotspot dicts ({'y_m','z_m',...}) collected over a
+    counting window. The imager's per-frame localisation jitters a few cm
+    around the true position (reconstruction noise + grid quantisation),
+    which maps to several % in the off-axis factor; the VECTOR mean (average
+    y and z, then take the norm) is an unbiased position estimate and damps
+    that jitter ~1/sqrt(n). Averaging |offset| directly would carry the
+    positive noise bias instead. Returns None for no samples.
+    Pure function (unit-tested).
+    """
+    if not entries:
+        return None
+    n = float(len(entries))
+    y = sum(e['y_m'] for e in entries) / n
+    z = sum(e['z_m'] for e in entries) / n
+    return {'y_m': y, 'z_m': z, 'offset_m': math.sqrt(y * y + z * z),
+            'n_samples': len(entries)}
 
 
 def gegi_intrinsic_efficiency(energy_keV):
@@ -147,6 +274,10 @@ class IsotopeConfig(object):
         # Linear attenuation coefficient (1/m) of the shielding-plate material at
         # this gamma line, for the in-line shielding correction (0 = none).
         self.mu_shield_per_m = cfg.get('mu_shield_per_m', 0.0) or 0.0
+        # Optional measured per-plate-count broad-beam transmissions
+        # ({n: T}); exact values beat the exponential (build-up grows with
+        # thickness). See shield_transmission().
+        self.plate_transmission = cfg.get('plate_transmission') or {}
 
         # Intrinsic efficiency: the geometry-independent detector constant.
         # Priority:
@@ -207,6 +338,28 @@ class ActivityNode(object):
         self.n_shielding_plates = int(args.get_int("n-shielding-plates"))
         self.plate_thickness_m = 0.0
         self.base_standoff_m = 0.0
+
+        # Position-aware correction: use the Compton imager's hotspot position
+        # to evaluate the solid angle (and slant shield path) OFF-AXIS instead
+        # of assuming the source sits on the detector axis. A corner source at
+        # rho ~0.25 m otherwise reads ~-15% (inverse square) - 8% (disk
+        # foreshortening) low. Default OFF until validated in the field.
+        self.position_correction = bool(args.get_bool("position-correction"))
+        # Hotspots older than this fall back to on-axis (imaging needs events;
+        # 120 s covers a quiet start-of-window without going stale mid-run).
+        self.position_max_age_s = float(args.get_float("position-max-age-s"))
+        # Geometry-factor exponent: (d0/d')^n. 2.0 = inverse-square only
+        # (measured best model - see off_axis_solid_angle_ratio); 3.0 = naive
+        # flat-disk with foreshortening (over-corrects on this detector).
+        self.position_geometry_exponent = float(
+            args.get_float("position-geometry-exponent"))
+        self._hotspots = {}
+        self._hotspot_stamp = None
+        # Rolling (stamp, hotspots) samples; the correction averages each
+        # nuclide's position over the counting window to damp the imager's
+        # few-cm per-frame localisation jitter (heatmap publishes every few
+        # seconds -> a 300 s window holds ~100 samples; maxlen is a bound).
+        self._hotspot_samples = collections.deque(maxlen=1000)
 
         node_name = args.get_string("node-name")
         counting_window_override_s = args.get_float("counting-window-s")
@@ -307,6 +460,11 @@ class ActivityNode(object):
 
         self.command_server = CommandServer(command_receiver, command_result_sender)
         self.command_server.on("clear", self._handle_clear)
+        # Publish the final, not-yet-full counting window on demand (called by
+        # the data recorder at end-of-run) so no tail data is lost when the
+        # window is long - e.g. counting_window_s == run length -> one window
+        # per run.
+        self.command_server.on("flush", self._handle_flush)
         self.command_server.start()
 
         # -- Subscribers ----------------------------------------------------
@@ -331,6 +489,20 @@ class ActivityNode(object):
         self.sub_plates = app.create_text_receiver(args, connection, plates_recv_cfg)
         self.sub_plates.on_receive(self._on_n_plates)
         self.sub_plates.start()
+
+        # Imaging hotspots for the position-aware correction. The heatmap node
+        # publishes gegi.heatmap.source_directions with one point per hotspot
+        # (x, y, z, isotope, count) - richer than the upstream ROS PoseArray +
+        # separate isotope-label String, so no separate pairing/race-condition
+        # workaround is needed here; _on_source_directions rebuilds the same
+        # 'Name:count' label format parse_hotspots() expects from the points.
+        self.sub_hotspots = None
+        if self.position_correction:
+            hotspots_cfg = prism.TextReceiverConfig()
+            hotspots_cfg.source = SOURCE_DIRECTIONS_TOPIC
+            self.sub_hotspots = app.create_text_receiver(args, connection, hotspots_cfg)
+            self.sub_hotspots.on_receive(self._on_source_directions)
+            self.sub_hotspots.start()
 
         logger.info("Activity node ready. Window=%.1fs, %d isotopes configured. "
                     "distance=%.3fm, solid_angle=%.6f, shielding_plates=%d",
@@ -408,7 +580,8 @@ class ActivityNode(object):
     def _shield_transmission(self, iso):
         """Fraction of this isotope's gammas transmitted through the plates."""
         return shield_transmission(
-            iso.mu_shield_per_m, self._total_plates(), self.plate_thickness_m)
+            iso.mu_shield_per_m, self._total_plates(), self.plate_thickness_m,
+            iso.plate_transmission)
 
     def _on_distance(self, message, source=None):
         """Callback for dynamic distance updates (DoubleValue, metres)."""
@@ -443,6 +616,82 @@ class ActivityNode(object):
             logger.info("Activity node: %d shielding plate(s) -> distance=%.3fm, "
                         "solid_angle=%.6f", self.n_shielding_plates,
                         self.source_distance_m, self.solid_angle_fraction)
+
+    def _on_source_directions(self, message, source=None):
+        """Cache the heatmap's imaged hotspots for the position-aware correction.
+
+        gegi.heatmap.source_directions carries one point per hotspot (x, y, z,
+        isotope, count), already index-aligned and race-free (unlike the
+        upstream ROS PoseArray + separate isotope-label String this was ported
+        from) - rebuild the 'Name:count' label format parse_hotspots() expects
+        and reuse it directly.
+        """
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        points = payload.get('points', []) or []
+        if points:
+            labels = "|".join(
+                "{}:{}".format(p.get('isotope', ''), int(p.get('count', 0) or 0))
+                for p in points)
+            yz = [(float(p.get('y', 0.0)), float(p.get('z', 0.0))) for p in points]
+        else:
+            labels = 'none'
+            yz = []
+        hotspots = parse_hotspots(labels, yz)
+        with self.lock:
+            self._hotspots = hotspots
+            self._hotspot_stamp = pmsg.now_seconds()
+            if hotspots:
+                self._hotspot_samples.append((self._hotspot_stamp, hotspots))
+
+    def _position_correction_for(self, iso):
+        """(factor, info) for this line's position-aware correction.
+
+        factor multiplies the on-axis efficiency product K: the imaged
+        off-axis solid-angle ratio times the extra slant-path shield
+        transmission. Returns (1.0, None) when the correction is disabled, no
+        fresh hotspot matches this line's nuclide, or geometry is unset - the
+        assay then falls back to the on-axis assumption unchanged.
+        """
+        if not self.position_correction or self.source_distance_m <= 0:
+            return 1.0, None
+        now = pmsg.now_seconds()
+        with self.lock:
+            hotspots = dict(self._hotspots)
+            stamp = self._hotspot_stamp
+            samples = list(self._hotspot_samples)
+        if not hotspots or stamp is None:
+            return 1.0, None
+        if (now - stamp) > self.position_max_age_s:
+            return 1.0, None
+        key = normalize_nuclide_name(iso.name)
+        hs = hotspots.get(key)
+        if hs is None:
+            return 1.0, None
+        # Average this nuclide's imaged position over the counting window
+        # (single-frame localisation jitters a few cm ~ several % in the
+        # factor); the latest frame is the fallback when only it exists.
+        window_entries = [h[key] for (t, h) in samples
+                          if key in h
+                          and (now - t) <= self.counting_window_s]
+        mean_hs = average_hotspot(window_entries)
+        if mean_hs is not None:
+            hs = mean_hs
+        d0 = self.source_distance_m
+        rho = hs['offset_m']
+        geom = off_axis_solid_angle_ratio(d0, rho, self.position_geometry_exponent)
+        shield = slant_shield_factor(iso.mu_shield_per_m, self._total_plates(),
+                                     self.plate_thickness_m, d0, rho)
+        info = {
+            'hotspot_offset_m': rho,
+            'slant_distance_m': math.sqrt(d0 * d0 + rho * rho),
+            'geometry_factor': geom,
+            'slant_shield_factor': shield,
+            'hotspot_samples': hs.get('n_samples', 1),
+        }
+        return geom * shield, info
 
     def _on_spectrum(self, message, source=None):
         """Accumulate incoming spectrum snapshots into the counting window."""
@@ -638,6 +887,7 @@ class ActivityNode(object):
         # In-line shielding attenuates the measured signal; divide by the
         # transmission to recover the true activity (energy-dependent).
         transmission = self._shield_transmission(iso)
+        position_factor, position_info = self._position_correction_for(iso)
 
         activity_Bq = 0.0
         epsilon_used = 0.0
@@ -645,16 +895,20 @@ class ActivityNode(object):
         if net_corrected > 0 and valid:
             if iso.intrinsic_efficiency > 0 and self.solid_angle_fraction > 0:
                 # First principles: A = N_net / (eps_intrinsic * Omega/(4pi) * I_gamma * t_live * T)
-                epsilon_abs = iso.intrinsic_efficiency * self.solid_angle_fraction
+                # position_factor refines Omega/(4pi) and T for an off-axis,
+                # imaged hotspot instead of assuming the source sits on-axis
+                # at source_distance_m.
+                epsilon_abs = iso.intrinsic_efficiency * self.solid_angle_fraction * position_factor
                 epsilon_used = epsilon_abs
                 activity_Bq = net_corrected / (
                     epsilon_abs * iso.emission_probability * live_time_s * transmission)
                 method_used = 'intrinsic_efficiency'
             elif iso.efficiency > 0 and iso.emission_probability > 0:
                 # Manual absolute efficiency override (legacy)
-                epsilon_used = iso.efficiency
+                epsilon_used = iso.efficiency * position_factor
                 activity_Bq = net_corrected / (
-                    iso.efficiency * iso.emission_probability * live_time_s * transmission)
+                    iso.efficiency * position_factor * iso.emission_probability * live_time_s
+                    * transmission)
                 method_used = 'manual_efficiency'
             else:
                 activity_Bq = 0.0
@@ -669,16 +923,19 @@ class ActivityNode(object):
         if activity_Bq > 0 and net_corrected > 0:
             sigma_activity_Bq = activity_Bq * (sigma_corrected / net_corrected)
 
-        return {
+        result = {
             'isotope': iso.name,
             'energy_keV': iso.energy_keV,
             'intrinsic_efficiency': iso.intrinsic_efficiency,
             'solid_angle_fraction': self.solid_angle_fraction,
             'absolute_efficiency': iso.intrinsic_efficiency * self.solid_angle_fraction,
+            'efficiency_product': epsilon_used,
             'source_distance_m': self.source_distance_m,
             'n_shielding_plates': self.n_shielding_plates,
             'total_shield_plates': self._total_plates(),
             'shield_transmission': transmission,
+            'position_corrected': position_info is not None,
+            'position_factor': position_factor,
             'method': method_used,
             'gross_counts': gross,
             'background_counts': background,
@@ -691,6 +948,24 @@ class ActivityNode(object):
             'valid': valid,
             'below_min_counts': not valid and net_peak_area > 0
         }
+        if position_info is not None:
+            result['hotspot_offset_m'] = position_info['hotspot_offset_m']
+            result['slant_distance_m'] = position_info['slant_distance_m']
+        return result
+
+    def _handle_flush(self, params):
+        """Force-publish the current partial counting window, then reset it.
+
+        No-op (returns False) when nothing has accumulated yet, so callers
+        can distinguish "flushed a real partial window" from "nothing to do".
+        """
+        with self.lock:
+            has_data = self.accumulated_real_time_ms > 0
+        if not has_data:
+            return False, "Nothing accumulated to flush"
+        self._compute_and_publish()
+        logger.info("Activity node: flushed partial counting window on demand")
+        return True, "Partial counting window flushed"
 
     def _handle_clear(self, params):
         with self.lock:

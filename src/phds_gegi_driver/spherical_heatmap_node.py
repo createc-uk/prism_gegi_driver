@@ -41,6 +41,17 @@ SOURCE_DIRECTIONS_TOPIC = "gegi.heatmap.source_directions"
 SOURCE_ISOTOPES_TOPIC = "gegi.heatmap.source_isotopes"
 ACTIVITY_RESULTS_TOPIC = "gegi.activity.results"
 EFFECTIVE_SOURCE_DISTANCE_TOPIC = "gegi.activity.effective_source_distance"
+# Data recorder's isotope-ID screening summary (see data_recorder_node.py's
+# IDENTIFIED_TOPIC docstring for the wire format: compact 'Name:score|...'
+# text, or 'none').
+IDENTIFIED_TOPIC = "gegi.data_recorder.identified"
+
+# Isotope-ID screening layer (matched-filter peak search + nuclide library
+# match). Optional: only used to load the nuclide library for identified_bands().
+try:
+    import isotope_id
+except ImportError:
+    isotope_id = None
 
 # Known isotope photo-peak energies (keV) and identification windows
 ISOTOPE_PEAKS = {
@@ -61,6 +72,63 @@ def _norm_iso(name):
     """Normalise an isotope name for lookup: uppercase, drop punctuation.
     So 'Cs137', 'Cs-137', 'cs_137' and 'Co60_1173' all collapse sensibly."""
     return ''.join(ch for ch in str(name).upper() if ch.isalnum())
+
+
+def parse_identified_msg(msg_text):
+    """Parse the data recorder's identified-lines summary into nuclide names.
+
+    msg_text: compact '|'-separated 'Name:score' text (see
+    data_recorder_node.pub_identified), e.g. 'Eu-152:0.83|Cs-137:1.00'.
+    'none' or '' (nothing identified) -> []. Pure function (unit-tested).
+    """
+    if not msg_text or msg_text == 'none':
+        return []
+    names = []
+    for part in msg_text.split('|'):
+        part = part.strip()
+        if not part:
+            continue
+        name = part.split(':', 1)[0].strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def identified_bands(names, nuclide_library, window_kev=30.0):
+    """Compton-imaging energy bands for the default isotopes PLUS any
+    additional nuclide the isotope-ID screening layer has identified.
+
+    names: nuclide names from parse_identified_msg (data recorder's screening
+    pass). nuclide_library: {name: {representative_keV, imaging_keV,
+    imaging_window_kev, ...}} (isotope_id.load_nuclide_library()['nuclides']).
+
+    The DEFAULT isotopes (ISOTOPE_PEAKS: Cs-137, Co-60) always keep their
+    hand-tuned band, even when also identified by screening - narrowing the
+    Co-60 band would starve the imaging statistics and worsen the hotspot
+    bias. A newly identified nuclide gets EITHER its library 'imaging_keV'/
+    'imaging_window_kev' override (a line CLUSTER the nuclide is better
+    imaged on, e.g. Eu-152's 964+1086+1112 keV group) or a window_kev-wide
+    band centred on its 'representative_keV'. Unknown names (not in the
+    library) are ignored. Pure function (unit-tested).
+    """
+    bands = dict(ISOTOPE_PEAKS)
+    for name in names:
+        if name in bands:
+            continue
+        nuc = nuclide_library.get(name)
+        if not nuc:
+            continue
+        if 'imaging_keV' in nuc:
+            energy = float(nuc['imaging_keV'])
+            window = float(nuc.get('imaging_window_kev', window_kev))
+        else:
+            rep = nuc.get('representative_keV')
+            if rep is None:
+                continue
+            energy = float(rep)
+            window = window_kev
+        bands[name] = {'energy': energy, 'window': window}
+    return bands
 
 
 def load_gamma_constants(config_path):
@@ -132,6 +200,21 @@ class SphericalHeatmapNode(object):
         # Dose-rate gamma constants, single-sourced from isotopes.yaml.
         self.isotopes_config = args.get_string("isotopes-config")
         self.gamma_constants = load_gamma_constants(self.isotopes_config)
+
+        # Nuclide library for identified_bands(): widens the imaging bands to
+        # nuclides the data recorder's isotope-ID screening layer identifies,
+        # beyond the default Cs-137/Co-60 (see identified_bands() docstring).
+        nuclide_library_path = args.get_string("nuclide-library")
+        self.nuclide_library = {}
+        if nuclide_library_path and isotope_id is not None:
+            try:
+                self.nuclide_library = isotope_id.load_nuclide_library(
+                    nuclide_library_path).get('nuclides', {})
+            except Exception as exc:
+                logger.warning("Could not load nuclide library %s: %s",
+                               nuclide_library_path, exc)
+        self._identified_names = []
+        self._identified_lock = threading.Lock()
 
         self.radius = args.get_float("radius")  # 1m diameter
         self.n_points = int(args.get_int("n-points"))
@@ -246,6 +329,14 @@ class SphericalHeatmapNode(object):
         self.sub_distance.on_receive(self._on_source_distance)
         self.sub_distance.start()
 
+        # Isotope-ID screening summary from the data recorder, widening the
+        # imaging bands beyond the default Cs-137/Co-60 (see identified_bands()).
+        identified_cfg = prism.TextReceiverConfig()
+        identified_cfg.source = IDENTIFIED_TOPIC
+        self.sub_identified = app.create_text_receiver(args, connection, identified_cfg)
+        self.sub_identified.on_receive(self._on_identified)
+        self.sub_identified.start()
+
         # -- Command channel (replaces the old ~clear / ~save_csv Trigger services)
         command_topic = "gegi.{}.command".format(node_name)
         command_result_topic = "gegi.{}.command_result".format(node_name)
@@ -293,6 +384,13 @@ class SphericalHeatmapNode(object):
         self.sub.stop()
         self.sub_activity.stop()
         self.sub_distance.stop()
+        self.sub_identified.stop()
+
+    def _on_identified(self, message, source=None):
+        """Cache the data recorder's latest isotope-ID screening names."""
+        names = parse_identified_msg(message)
+        with self._identified_lock:
+            self._identified_names = names
 
     def _on_source_distance(self, message, source=None):
         """Update sphere radius / dose standoff from the plate-derived distance."""
@@ -746,10 +844,16 @@ class SphericalHeatmapNode(object):
         }
         self.pub_direction.send(json.dumps(direction_msg))
 
-        # Find peaks per isotope energy band. Collect raw candidates first, then
-        # apply temporal persistence to drop flickering ghost peaks before publish.
+        # Find peaks per isotope energy band (default Cs-137/Co-60 plus any
+        # nuclide the data recorder's isotope-ID screening layer has identified
+        # - see identified_bands()). Collect raw candidates first, then apply
+        # temporal persistence to drop flickering ghost peaks before publish.
+        with self._identified_lock:
+            identified_names = list(self._identified_names)
+        bands = identified_bands(identified_names, self.nuclide_library)
+
         raw_candidates = []
-        for iso_name, iso_info in ISOTOPE_PEAKS.items():
+        for iso_name, iso_info in bands.items():
             # Band-filter this isotope's events once.
             e_lo = iso_info['energy'] - iso_info['window']
             e_hi = iso_info['energy'] + iso_info['window']
@@ -823,7 +927,7 @@ class SphericalHeatmapNode(object):
             dose_rates = dict(self._dose_rate_uSv_h)
 
         iso_norm_scores = {}
-        for iso_name, iso_info in ISOTOPE_PEAKS.items():
+        for iso_name, iso_info in bands.items():
             iso_scores, iso_count = self._solve_energy_filtered(
                 events, iso_info['energy'], iso_info['window'])
             if iso_count >= 5:
@@ -1062,6 +1166,10 @@ def main():
                              "GeGi spherical Compton back-projection heatmap", sys.argv)
 
     app.add_string_option("Heatmap", "isotopes-config", "Path to isotopes.yaml configuration", "")
+    app.add_string_option("Heatmap", "nuclide-library",
+                          "Path to nuclide_library.yaml, for widening imaging bands to "
+                          "nuclides identified by the data recorder's isotope-ID screening "
+                          "layer (empty = only the default Cs-137/Co-60 bands)", "")
     app.add_float_option("Heatmap", "radius", "Sphere radius in metres", 0.5)
     app.add_int_option("Heatmap", "n-points", "Number of points on the sphere grid", 8000)
     app.add_float_option("Heatmap", "window-s", "Rolling event window in seconds", 180.0)

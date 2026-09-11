@@ -54,6 +54,23 @@ namespace phds_gegi_driver {
         idle_poll_interval_sec_ = args["idle-poll-interval-sec"].as<double>();
         busy_poll_interval_sec_ = args["busy-poll-interval-sec"].as<double>();
 
+        // Energy-scale correction applied to every parsed site energy (keV):
+        // corrected = c0 + c1*E + c2*E^2. Defaults 0.0/1.0/0.0 = no correction
+        // (ported from upstream's energy_cal_c0/c1/c2 ROS params). CLI flags
+        // take precedence; config/gegi_driver.yaml's top-level energy_cal_c0/
+        // c1/c2 keys (read via Configuration::get(), the same mechanism used
+        // for endpoint overrides) act as the config-file default, following
+        // the same override pattern as detector-frame above.
+        double energy_cal_c0 = args["energy-cal-c0"].as<double>();
+        double energy_cal_c1 = args["energy-cal-c1"].as<double>();
+        double energy_cal_c2 = args["energy-cal-c2"].as<double>();
+        if (auto v = app.getConfig().get("energy_cal_c0")) energy_cal_c0 = std::stod(*v);
+        if (auto v = app.getConfig().get("energy_cal_c1")) energy_cal_c1 = std::stod(*v);
+        if (auto v = app.getConfig().get("energy_cal_c2")) energy_cal_c2 = std::stod(*v);
+        tcp_event_reader_.setEnergyCorrection(energy_cal_c0, energy_cal_c1, energy_cal_c2);
+        PSM_INFO("Energy calibration correction: c0={} c1={} c2={}",
+                 energy_cal_c0, energy_cal_c1, energy_cal_c2);
+
         // Senders (decorated: void send(), PrismCore integration built-in).
         event_sender_ = app.createTextSender(
             args, connection, makeSenderConfig(app, "compton_event", "gegi.driver.compton_event"));
@@ -91,6 +108,8 @@ namespace phds_gegi_driver {
                              [this](const nlohmann::json &p) { return handleStopAcquisition(p); });
         command_server_->on("clear_data",
                              [this](const nlohmann::json &p) { return handleClearData(p); });
+        command_server_->on("clear_data_and_windows",
+                             [this](const nlohmann::json &p) { return handleClearDataAndWindows(p); });
         command_server_->on("toggle_bias_mode",
                              [this](const nlohmann::json &p) { return handleToggleBiasMode(p); });
         command_server_->on("start_timed_acquisition",
@@ -189,6 +208,16 @@ namespace phds_gegi_driver {
         command_channel::CommandResult result;
         result.success = tcp_event_reader_.sendClearData();
         result.message = result.success ? "Clear data command sent" : "Failed to send clear data command";
+        return result;
+    }
+
+    command_channel::CommandResult PhdsGegiDriver::handleClearDataAndWindows(const nlohmann::json & /*params*/) {
+        PSM_INFO("Received clear_data_and_windows command");
+        command_channel::CommandResult result;
+        result.success = tcp_event_reader_.sendClearDataAndWindows();
+        result.message = result.success
+            ? "Clear data and windows command sent"
+            : "Failed to send clear data and windows command";
         return result;
     }
 

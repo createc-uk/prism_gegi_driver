@@ -49,6 +49,14 @@ namespace phds_gegi_driver {
         command_channel::CommandResult handleStartAcquisition(const nlohmann::json &params);
         command_channel::CommandResult handleStopAcquisition(const nlohmann::json &params);
         command_channel::CommandResult handleClearData(const nlohmann::json &params);
+        // Deep onboard clear (data + windows, GeGi 'x' command). Ported from
+        // upstream's handleClearDataAndWindows: the data-only clear ('c',
+        // handleClearData above) was found to leave residual spectral content
+        // that survives into the next run (stale-spectrum phantoms - e.g. a
+        // persistent low-level Cs-137 line bleeding into a Co-only run). Use
+        // this at the start of every recorded run; handleClearData remains for
+        // callers that must not touch onboard window state.
+        command_channel::CommandResult handleClearDataAndWindows(const nlohmann::json &params);
         command_channel::CommandResult handleToggleBiasMode(const nlohmann::json &params);
         command_channel::CommandResult handleStartTimedAcquisition(const nlohmann::json &params);
 

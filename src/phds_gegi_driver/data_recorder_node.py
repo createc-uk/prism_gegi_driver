@@ -38,6 +38,7 @@ import math
 import struct
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -46,6 +47,14 @@ import yaml
 
 import prism_messages as pmsg
 from prism_command_channel import CommandServer, CommandClient
+
+# Isotope-ID screening layer (matched-filter peak search + nuclide library
+# match). Optional: the recorder runs without it if the module or a
+# --nuclide-library path is not configured.
+try:
+    import isotope_id
+except ImportError:
+    isotope_id = None
 
 logging.basicConfig(level=logging.INFO,
                      format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -64,6 +73,15 @@ CLOUD_META_TOPIC = "gegi.heatmap.cloud_meta"
 DETECTOR_COMMAND_TOPIC = "gegi.detector.command"
 DETECTOR_COMMAND_RESULT_TOPIC = "gegi.detector.command_result"
 DETECTOR_RUN_INFO_TOPIC = "gegi.detector.run_info"
+
+# Isotope-ID screening results: compact pipe-separated "Name:score" text (raw,
+# no JSON wrapper - same convention as gegi.heatmap.source_isotopes), e.g.
+# "Eu-152:0.83|Cs-137:1.00", or "none". Published by this node's periodic
+# screening pass over the rolling live spectrum; consumed by
+# spherical_heatmap_node (parse_identified_msg + identified_bands) to widen
+# its imaging bands to nuclides beyond the default Cs-137/Co-60, and by
+# tools/plot_live_spectrum.py to label peaks.
+IDENTIFIED_TOPIC = "gegi.data_recorder.identified"
 
 DEFAULT_NODE_CLEAR_TARGETS = (
     "gegi.spherical_heatmap.command:clear,"
@@ -116,6 +134,45 @@ def gamma_constant_for(table, iso_name, default=0.077):
         if key.startswith(k) or k.startswith(key):
             return v
     return default
+
+
+def screening_xml_block(id_results, unknown_peaks, exclude_names=()):
+    """N42 <Nuclide> entries for SCREENING identifications + an unknown-peaks
+    remark. Pure function (unit-tested).
+
+    Screening = the isotope-ID layer's spectral library match: it says a
+    nuclide IS PRESENT but carries no activity (no calibration for it). Any
+    nuclide already reported by the assay layer (quantified or MDA) is
+    excluded so it is not listed twice. Returns (list_of_nuclide_xml, remark).
+    """
+    blocks = []
+    for r in id_results or []:
+        if not r.get('identified') or r.get('nuclide') in exclude_names:
+            continue
+        lines_txt = ", ".join(
+            "{:.0f} keV (SNR {:.0f})".format(m['energy_keV'], m['snr'])
+            for m in r.get('matched_lines', []))
+        shared = "".join(
+            " AMBIGUITY: {:.1f} keV peak also matches {}.".format(
+                s['peak_keV'], "/".join(s['also']))
+            for s in r.get('shared_peaks', []))
+        blocks.append(
+            '      <Nuclide>\n'
+            '        <NuclideIdentifiedIndicator>true</NuclideIdentifiedIndicator>\n'
+            '        <NuclideName>{name}</NuclideName>\n'
+            '        <Remark>SCREENING identification (spectral library match; '
+            'no calibration, so no activity is quoted): category {cat}, '
+            'score {score:.2f}, lines {lines}.{shared}</Remark>\n'
+            '      </Nuclide>'.format(
+                name=r['nuclide'], cat=r.get('category', ''),
+                score=r.get('score', 0.0), lines=lines_txt, shared=shared))
+    remark = ''
+    if unknown_peaks:
+        remark = ('    <Remark>Screening: unidentified peaks at {} - matching '
+                  'no library nuclide.</Remark>\n'.format(
+                      ", ".join("{:.1f} keV (SNR {:.0f})".format(
+                          p['energy_keV'], p['snr']) for p in unknown_peaks)))
+    return blocks, remark
 
 
 def _median(values):
@@ -280,6 +337,32 @@ class DataRecorderNode(object):
         # Dose-rate gamma constants, single-sourced from isotopes.yaml.
         self.gamma_constants = load_gamma_constants(self.isotopes_config)
 
+        # Isotope-ID screening layer: an optional continuous matched-filter
+        # scan of a rolling live-spectrum window, independent of the recorder's
+        # recording state, plus a final full-resolution pass over the whole
+        # run's accumulated spectrum at stop time (embedded in the N42).
+        nuclide_library_path = args.get_string("nuclide-library")
+        self.isotope_id_period_s = args.get_float("isotope-id-period-s")
+        self.isotope_id_window_s = args.get_float("isotope-id-window-s")
+        self.nuclide_library = None
+        if nuclide_library_path and isotope_id is not None:
+            try:
+                self.nuclide_library = isotope_id.load_nuclide_library(nuclide_library_path)
+            except Exception as exc:
+                logger.warning("Could not load nuclide library %s: %s",
+                               nuclide_library_path, exc)
+        # Rolling window of (timestamp, spectrum_array, real_time_ms) tuples,
+        # summed and screened every isotope_id_period_s regardless of whether
+        # a timed recording is in progress.
+        self._live_spectra = deque()
+        self._live_lock = threading.Lock()
+        self._prev_line_energies = []
+        # Nuclides already reported (quantified or MDA) by the assay layer;
+        # excluded from the screening block so they are not listed twice.
+        self._screening_exclude_names = set(self._RADIONUCLIDE_MAP.values())
+        self._id_stop_event = threading.Event()
+        self._id_thread = None
+
         # Recording state
         self.lock = threading.Lock()
         self.recording = False
@@ -410,6 +493,15 @@ class DataRecorderNode(object):
         # Latest activity per isotope (name -> MBq)
         self._latest_activity_MBq = {}
 
+        # -- Isotope-ID screening results publisher --------------------------
+        identified_cfg = prism.TextSenderConfig()
+        identified_cfg.destination = IDENTIFIED_TOPIC
+        self.pub_identified = app.create_text_sender(args, connection, identified_cfg)
+
+        if self.nuclide_library is not None:
+            self._id_thread = threading.Thread(target=self._isotope_id_loop, daemon=True)
+            self._id_thread.start()
+
         logger.info("Data recorder node ready. Output dir: %s", self.output_dir)
 
     @staticmethod
@@ -442,6 +534,9 @@ class DataRecorderNode(object):
         return clients
 
     def stop(self):
+        self._id_stop_event.set()
+        if self._id_thread is not None:
+            self._id_thread.join(timeout=2.0)
         self.command_server.stop()
         self.sub_compton.stop()
         self.sub_spectrum.stop()
@@ -513,19 +608,33 @@ class DataRecorderNode(object):
         return True, "Recording stopped early. Data saved."
 
     def _handle_clear_all(self, params):
-        """Clear the detector hardware AND every downstream node's accumulator buffer."""
+        """Clear the detector hardware AND every downstream node's accumulator buffer.
+
+        Prefers the deep onboard clear (clear_data_and_windows, GeGi 'x'
+        command) over the data-only clear_data ('c'): the data-only clear was
+        found to leave residual spectral content that survives into the next
+        run (stale-spectrum phantoms, e.g. a persistent low-level Cs-137 line
+        bleeding into a Co-only run - ported from upstream's
+        handleClearDataAndWindows fix). Falls back to clear_data if the deep
+        clear command is not recognised (older driver build).
+        """
         results = []
         all_ok = True
 
-        # 1) Hardware data buffer
-        try:
-            r = self._detector_client.call({"command": "clear_data"}, timeout=3.0)
-            ok = bool(r) and bool(r.get("success"))
-            results.append("{}:{}".format(DETECTOR_COMMAND_TOPIC, "ok" if ok else "fail"))
-            all_ok = all_ok and ok
-        except Exception as e:
-            results.append("{}:err({})".format(DETECTOR_COMMAND_TOPIC, e))
-            all_ok = False
+        # 1) Hardware data buffer (deep clear, with a data-only fallback).
+        cleared = False
+        for command in ("clear_data_and_windows", "clear_data"):
+            try:
+                r = self._detector_client.call({"command": command}, timeout=3.0)
+                ok = bool(r) and bool(r.get("success"))
+                results.append("{}:{}:{}".format(
+                    DETECTOR_COMMAND_TOPIC, command, "ok" if ok else "fail"))
+                cleared = ok
+                if ok:
+                    break
+            except Exception as e:
+                results.append("{}:{}:err({})".format(DETECTOR_COMMAND_TOPIC, command, e))
+        all_ok = cleared
 
         # 2) Downstream node buffers (heatmap event window, spectra, activity window)
         for client, cmd, topic in self._node_clear_clients:
@@ -610,6 +719,17 @@ class DataRecorderNode(object):
         # (the detector publishes RunInfo periodically; see _on_run_info).
         detector_run_info = self._fetch_detector_run_info_post_stop()
 
+        # Final full-resolution isotope-ID screening pass over the WHOLE run's
+        # accumulated spectrum (much better statistics than any one live-window
+        # slice), embedded into the N42 as SCREENING <Nuclide> entries.
+        id_results, unknown_peaks = [], []
+        if self.nuclide_library is not None:
+            try:
+                _peaks, id_results, unknown_peaks = isotope_id.identify(
+                    spectrum.astype(np.float64), self.bin_edges, self.nuclide_library)
+            except Exception as exc:
+                logger.warning("End-of-run isotope-ID screening failed: %s", exc)
+
         # Close events file
         if events_file:
             events_file.close()
@@ -618,7 +738,8 @@ class DataRecorderNode(object):
         # Save spectrum as N42, with the run's activity results embedded so the
         # N42 is a complete standards-compliant record (spectrum + activities).
         self._save_n42(prefix, spectrum, real_time_ms, live_time_ms,
-                       measurement_id, reference_datetime, activities)
+                       measurement_id, reference_datetime, activities,
+                       id_results, unknown_peaks)
 
         # Save heatmap raw points CSV (irregular, per-isotope scores)
         try:
@@ -734,14 +855,79 @@ class DataRecorderNode(object):
             spec = pmsg.parse_spectrum(payload)
         except Exception:
             return
+        arr = np.array(spec.get('spectrum', []), dtype=np.uint32)
+
+        # Continuous isotope-ID screening window: kept regardless of whether
+        # a timed recording is in progress, so a quiet screening scan is
+        # always available (e.g. for the live plot tool), independent of the
+        # per-run recorder state below.
+        if self.nuclide_library is not None:
+            with self._live_lock:
+                self._live_spectra.append(
+                    (time.time(), arr.astype(np.float64), spec.get('real_time_ms', 0)))
+                self._trim_live_spectra()
+
         with self.lock:
             if not self.recording:
                 return
-            arr = np.array(spec.get('spectrum', []), dtype=np.uint32)
             n = min(len(arr), len(self.accumulated_spectrum))
             self.accumulated_spectrum[:n] += arr[:n]
             self.total_real_time_ms += spec.get('real_time_ms', 0)
             self.total_live_time_ms += (spec.get('real_time_ms', 0) - spec.get('dead_time_ms', 0))
+
+    def _trim_live_spectra(self, now=None):
+        """Drop live-window samples older than isotope_id_window_s. Caller
+        must hold self._live_lock."""
+        now = time.time() if now is None else now
+        cutoff = now - self.isotope_id_window_s
+        while self._live_spectra and self._live_spectra[0][0] < cutoff:
+            self._live_spectra.popleft()
+
+    def _isotope_id_loop(self):
+        """Background thread: periodically screen the rolling live-spectrum
+        window and publish a compact identified-lines summary.
+
+        Runs independent of self.recording so downstream consumers
+        (spherical_heatmap_node, tools/plot_live_spectrum.py) always have a
+        fresh screening result, not just during timed acquisitions.
+        """
+        while not self._id_stop_event.wait(self.isotope_id_period_s):
+            try:
+                self._run_live_screening_pass()
+            except Exception as exc:  # noqa: broad - never let this thread die
+                logger.warning("Isotope-ID screening pass failed: %s", exc)
+
+    def _run_live_screening_pass(self):
+        with self._live_lock:
+            self._trim_live_spectra()
+            samples = list(self._live_spectra)
+        if not samples:
+            return
+        total = np.zeros(len(self.bin_edges), dtype=np.float64)
+        for _t, arr, _rt in samples:
+            n = min(len(arr), len(total))
+            total[:n] += arr[:n]
+
+        peaks, results, unknown = isotope_id.identify(total, self.bin_edges, self.nuclide_library)
+        lines = [r for r in results if r.get('identified')]
+
+        # Flicker suppression: a peak only counts as 'persistent' (safe to
+        # display/report) once it has appeared in back-to-back passes, unless
+        # it is already an obvious strong (>=10 sigma) peak.
+        self._prev_line_energies = isotope_id.mark_persistent(peaks, self._prev_line_energies)
+
+        drift_kev, n_drift_lines = isotope_id.energy_drift_kev(results)
+        if n_drift_lines >= 3 and abs(drift_kev) > 3.0:
+            logger.warning("Isotope-ID screening: energy calibration drift %.2f keV "
+                           "over %d matched lines - check EnergyCal/energy_cal_c0..c2",
+                           drift_kev, n_drift_lines)
+
+        if lines:
+            text = "|".join("{}:{:.2f}".format(r['nuclide'], r.get('score', 0.0))
+                            for r in lines)
+        else:
+            text = "none"
+        self.pub_identified.send(text)
 
     def _on_peaks(self, message, source=None):
         try:
@@ -850,8 +1036,11 @@ class DataRecorderNode(object):
             except (ValueError, TypeError):
                 pass
 
-    def _build_analysis_results_xml(self, activities, measurement_id):
-        """Build the N42 <AnalysisResults> block: the run-level nuclide activities.
+    def _build_analysis_results_xml(self, activities, measurement_id,
+                                    id_results=None, unknown_peaks=None):
+        """Build the N42 <AnalysisResults> block: the run-level nuclide activities,
+        plus (if a nuclide library is configured) SCREENING identifications for
+        nuclides the isotope-ID layer sees but the assay layer does not quantify.
 
         N42.42 has native elements for nuclide activity results, so the spectrum
         and the activities derived from it travel together in one standards
@@ -862,9 +1051,11 @@ class DataRecorderNode(object):
         Co-60's two photopeaks quantify the same nuclide and are averaged.
         """
         lines = aggregate_run_activity(activities)
-        if not lines:
+        screening_blocks, screening_remark = screening_xml_block(
+            id_results, unknown_peaks, exclude_names=self._screening_exclude_names)
+        if not lines and not screening_blocks and not screening_remark:
             return ""
-        nuclides = group_by_radionuclide(lines, self._controlled_radionuclide)
+        nuclides = group_by_radionuclide(lines, self._controlled_radionuclide) if lines else {}
         u_sys = self.assay_systematic_uncertainty_pct
 
         nuclide_xml = []
@@ -906,6 +1097,8 @@ class DataRecorderNode(object):
                     label=label, used=res['windows_used'],
                     dropped=res['windows_dropped'], live=res['live_time_s']))
 
+        nuclide_xml.extend(screening_blocks)
+
         ref = (' radMeasurementReferences="{}"'.format(measurement_id)
                if measurement_id else '')
         return (
@@ -915,16 +1108,18 @@ class DataRecorderNode(object):
             'uncertainty (k=2, 95%), combining per-run counting statistics with the '
             'systematic assay uncertainty ({us:.1f}% 1sigma, dominated by source '
             'position within the tray). It is NOT counting statistics alone.</Remark>\n'
+            '{screening_remark}'
             '    <NuclideAnalysisResults>\n{nuclides}\n'
             '    </NuclideAnalysisResults>\n'
             '    <PeakAnalysisResults>\n{peaks}\n'
             '    </PeakAnalysisResults>\n'
             '  </AnalysisResults>\n'.format(
-                ref=ref, us=u_sys,
+                ref=ref, us=u_sys, screening_remark=screening_remark,
                 nuclides="\n".join(nuclide_xml), peaks="\n".join(peak_xml)))
 
     def _save_n42(self, prefix, spectrum, real_time_ms, live_time_ms,
-                  measurement_id="", reference_datetime="", activities=None):
+                  measurement_id="", reference_datetime="", activities=None,
+                  id_results=None, unknown_peaks=None):
         """Save spectrum in ANSI N42.42 XML format.
 
         The measurement_id is stamped onto <RadMeasurement id=...> so the raw
@@ -990,7 +1185,7 @@ class DataRecorderNode(object):
             measurement_id=measurement_id,
             reference_datetime=reference_datetime,
             analysis_results=self._build_analysis_results_xml(
-                activities or [], measurement_id)
+                activities or [], measurement_id, id_results, unknown_peaks)
         )
 
         with open(filepath, 'w') as f:
@@ -1483,6 +1678,14 @@ def main():
     app.add_string_option("Recorder", "node-name",
                           "Used to build gegi.<node-name>.command(_result) topic names",
                           "data_recorder")
+    app.add_string_option("Recorder", "nuclide-library",
+                          "Path to nuclide_library.yaml for the isotope-ID screening layer "
+                          "(empty = screening disabled)", "")
+    app.add_float_option("Recorder", "isotope-id-period-s",
+                         "Screening pass interval over the rolling live window, seconds", 20.0)
+    app.add_float_option("Recorder", "isotope-id-window-s",
+                         "Rolling live-spectrum window summed for continuous screening, seconds",
+                         180.0)
 
     result = app.parse()
     if result is None:

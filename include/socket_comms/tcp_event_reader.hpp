@@ -115,6 +115,13 @@ namespace phds_gegi_driver::socket_comms {
         std::atomic<bool> have_run_info_ {false};
         std::atomic<std::uint64_t> run_info_seq_ {0};  // bumped on each inline parse
 
+        // Detector-info replies ('d') are also multiplexed onto the SAME
+        // event stream. Decode them in the monitor thread instead of stealing
+        // event bytes with a competing status-reader thread.
+        DetectorInfo latest_detector_info_;
+        std::mutex detector_info_mutex_;
+        std::atomic<std::uint64_t> detector_info_seq_ {0};
+
         static constexpr int PACKET_SIZE_BYTES_ = 92;  // Legacy: max packet size (Compton events)
     };
 } // namespace phds_gegi_driver::socket_comms

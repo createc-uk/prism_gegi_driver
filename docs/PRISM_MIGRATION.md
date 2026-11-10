@@ -103,6 +103,26 @@ It is a per-run table of detected isotope lines. Consumers needing per-window
 time series must subscribe to `gegi.activity.results` and retain that feed
 separately. Database ingestion should distinguish the two semantics.
 
+Detector run-info and detector-info replies now share the monitor
+thread's **single socket reader**. An earlier detector-info poll independently
+flushed and read the event socket for up to six seconds, which could discard
+events and starve a deep-clear command beyond its three-second deadline.
+Both 28-byte idle/status replies and variable-length event frames are decoded
+inline. The software-only simulator exercises the clear/start/stop path while
+status polling runs concurrently.
+
+Run the optional full-system smoke test (after building the C++ driver and
+Prism CLI and installing the Prism Python bindings and `nats-server`):
+
+```bash
+python3 test/simulated_pipeline_smoke.py
+```
+
+This binds NATS and the fake GeGi **only to 127.0.0.1**; it does not
+communicate with any real detector. The temporary measurement outputs are
+checked for a nonempty Compton log, nonzero N42 channel counts, CSV, valid
+manifest asset links and response decoding, and deleted afterward.
+
 **Still requires supervised detector verification:** whether deep-clear
 actually resets onboard windows, firmware-specific responses, live-time
 completion under dead time, high-rate TCP parsing and full end-to-end assay

@@ -24,6 +24,7 @@
 
 #include <prism/core/sender_interface.hpp>
 #include <prism/core/text_receiver.hpp>
+#include <prism/core/text_sender.hpp>
 #include <prism/utils/logger.hpp>
 
 #include <nlohmann/json.hpp>
@@ -31,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -79,7 +81,7 @@ namespace phds_gegi_driver::command_channel {
     class CommandServer {
     public:
         CommandServer(std::shared_ptr<psm::TextReceiver> commandReceiver,
-                       std::shared_ptr<psm::SenderInterface<std::string>> resultSender)
+                       std::shared_ptr<psm::TextSender> resultSender)
             : commandReceiver_(std::move(commandReceiver)),
               resultSender_(std::move(resultSender)) {
             commandReceiver_->setMessageHandler(
@@ -98,6 +100,9 @@ namespace phds_gegi_driver::command_channel {
 
     private:
         void handleMessage(const std::string &message) {
+            // Treat a single command topic as a serialized execution channel.
+            // Replaying a request_id must not reissue detector side effects.
+            std::lock_guard<std::mutex> dispatchLock(dispatchMutex_);
             std::string commandName;
             std::string requestId;
             CommandResult result;
@@ -105,6 +110,25 @@ namespace phds_gegi_driver::command_channel {
                 auto j = nlohmann::json::parse(message);
                 commandName = j.value("command", std::string());
                 requestId = j.value("request_id", std::string());
+                if (!requestId.empty()) {
+                    const auto cached = completed_.find(requestId);
+                    if (cached != completed_.end()) {
+                        if (cached->second.first != commandName) {
+                            CommandResult rejected;
+                            rejected.command = commandName;
+                            rejected.request_id = requestId;
+                            rejected.message = "request_id already used for another command";
+                            rejected.stamp = messages::nowSeconds();
+                            nlohmann::json rejection = rejected;
+                            if (!resultSender_->send(rejection.dump())) {
+                                PSM_ERROR("CommandServer: result publication failed for {}", requestId);
+                            }
+                        } else if (!resultSender_->send(cached->second.second)) {
+                            PSM_ERROR("CommandServer: cached result publication failed for {}", requestId);
+                        }
+                        return;
+                    }
+                }
 
                 auto it = handlers_.find(commandName);
                 if (it == handlers_.end()) {
@@ -123,11 +147,25 @@ namespace phds_gegi_driver::command_channel {
             result.stamp = messages::nowSeconds();
 
             nlohmann::json outJson = result;
-            resultSender_->send(outJson.dump());
+            const std::string serialized = outJson.dump();
+            if (!requestId.empty()) {
+                completed_[requestId] = {commandName, serialized};
+                order_.push_back(requestId);
+                if (order_.size() > 1024) {
+                    completed_.erase(order_.front());
+                    order_.pop_front();
+                }
+            }
+            if (!resultSender_->send(serialized)) {
+                PSM_ERROR("CommandServer: failed to publish command_result");
+            }
         }
 
+        std::mutex dispatchMutex_;
+        std::unordered_map<std::string, std::pair<std::string, std::string>> completed_;
+        std::deque<std::string> order_;
         std::shared_ptr<psm::TextReceiver> commandReceiver_;
-        std::shared_ptr<psm::SenderInterface<std::string>> resultSender_;
+        std::shared_ptr<psm::TextSender> resultSender_;
         std::unordered_map<std::string, Handler> handlers_;
     };
 

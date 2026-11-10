@@ -23,6 +23,7 @@ protocol Prism supports).
 import json
 import threading
 import uuid
+from collections import OrderedDict
 
 from prism_messages import make_command_result, now_seconds
 
@@ -38,6 +39,9 @@ class CommandServer(object):
         self._command_receiver = command_receiver
         self._result_sender = result_sender
         self._handlers = {}
+        self._dispatch_lock = threading.RLock()
+        self._completed = OrderedDict()
+        self._completed_limit = 1024
         self._command_receiver.on_receive(self._on_message)
 
     def on(self, command_name, handler):
@@ -61,21 +65,52 @@ class CommandServer(object):
         response_message = ""
         try:
             params = json.loads(message)
+            if not isinstance(params, dict):
+                raise ValueError("command must be an object")
             command_name = params.get("command", "")
             request_id = params.get("request_id", "")
+            if not isinstance(command_name, str) or not isinstance(request_id, str):
+                raise ValueError("command and request_id must be strings")
+        except Exception as exc:
+            response_message = "Malformed command message: {}".format(exc)
+            self._result_sender.send(json.dumps(make_command_result(
+                command_name, False, response_message,
+                request_id=request_id or None, stamp=now_seconds())))
+            return
 
-            handler = self._handlers.get(command_name)
-            if handler is None:
-                response_message = "Unknown command: {}".format(command_name)
+        # Keep side-effectful commands at-most-once *within this process* for a
+        # given request_id. An in-flight duplicate is serialized, and a later
+        # duplicate gets the identical cached reply. Does not confer exactly-once
+        # execution across driver restarts or MQTT/NATS network partitions.
+        with self._dispatch_lock:
+            if request_id and request_id in self._completed:
+                prev_command, prev_result = self._completed[request_id]
+                self._completed.move_to_end(request_id)
+                if prev_command != command_name:
+                    reply = make_command_result(
+                        command_name, False,
+                        "request_id already used for another command",
+                        request_id=request_id, stamp=now_seconds())
+                    output = json.dumps(reply)
+                else:
+                    output = prev_result
             else:
-                success, response_message = handler(params)
-        except Exception as e:
-            response_message = "Malformed command message: {}".format(e)
-
-        result = make_command_result(command_name, success, response_message,
-                                      request_id=request_id or None,
-                                      stamp=now_seconds())
-        self._result_sender.send(json.dumps(result))
+                try:
+                    handler = self._handlers.get(command_name)
+                    if handler is None:
+                        response_message = "Unknown command: {}".format(command_name)
+                    else:
+                        success, response_message = handler(params)
+                except Exception as exc:
+                    response_message = "Command handler failed: {}".format(exc)
+                output = json.dumps(make_command_result(
+                    command_name, success, response_message,
+                    request_id=request_id or None, stamp=now_seconds()))
+                if request_id:
+                    self._completed[request_id] = (command_name, output)
+                    while len(self._completed) > self._completed_limit:
+                        self._completed.popitem(last=False)
+            self._result_sender.send(output)
 
 
 class CommandClient(object):
@@ -116,11 +151,12 @@ class CommandClient(object):
         with self._lock:
             self._pending[request_id] = {"event": event, "result": None}
 
-        self._command_sender.send(json.dumps(command))
-
-        got = event.wait(timeout)
-        with self._lock:
-            entry = self._pending.pop(request_id, None)
+        try:
+            self._command_sender.send(json.dumps(command))
+            got = event.wait(timeout)
+        finally:
+            with self._lock:
+                entry = self._pending.pop(request_id, None)
         if not got or entry is None:
             return None
         return entry["result"]

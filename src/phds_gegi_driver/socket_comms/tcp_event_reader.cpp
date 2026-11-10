@@ -193,15 +193,8 @@ namespace phds_gegi_driver::socket_comms {
         std::cout << "Connecting to GeGI at " + ip + ":" + port << "..." << std::endl;
 
         tcp::resolver resolver(io_service_);
-        tcp::resolver::query query(ip, port);
-        tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
-
-        try {
-            boost::asio::connect(socket_, endpoint_iterator);
-
-        } catch (const std::exception &ex) {
-            throw;
-        }
+        // Modern Boost.Asio: resolver::query/iterator were removed.
+        boost::asio::connect(socket_, resolver.resolve(ip, port));
 
         // NOTE: Do NOT open a second TCP connection for commands.
         //

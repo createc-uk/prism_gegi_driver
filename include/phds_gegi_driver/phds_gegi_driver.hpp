@@ -86,6 +86,9 @@ namespace phds_gegi_driver {
         std::thread state_thread_;
         std::atomic<bool> state_thread_running_{false};
         std::atomic<bool> acquisition_active_{false};
+        // The timed presets are LIVE-time limited, not wall-clock limited.
+        // Reset busy polling only when the detector reports the live-time target.
+        std::atomic<double> timed_target_live_sec_{0.0};
 
         double idle_poll_interval_sec_ = 2.0;
         double busy_poll_interval_sec_ = 30.0;

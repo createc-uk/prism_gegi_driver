@@ -31,9 +31,9 @@ int main(int argc, char *argv[]) {
             ("busy-poll-interval-sec", "run_info/detector_info republish interval while acquisition is active (s)",
              cxxopts::value<double>()->default_value("30.0"))
             ("energy-cal-c0", "Energy calibration correction c0 (keV): corrected = c0 + c1*E + c2*E^2",
-             cxxopts::value<double>()->default_value("0.0"))
+             cxxopts::value<double>()->default_value("-0.0861"))
             ("energy-cal-c1", "Energy calibration correction c1 (unitless gain term)",
-             cxxopts::value<double>()->default_value("1.0"))
+             cxxopts::value<double>()->default_value("0.9994308"))
             ("energy-cal-c2", "Energy calibration correction c2 (1/keV, quadratic term)",
              cxxopts::value<double>()->default_value("0.0"));
 
@@ -48,11 +48,12 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        phds_gegi_driver::PhdsGegiDriver driver(app, *result, connection);
-
-        while (app.isRunning()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        {
+            phds_gegi_driver::PhdsGegiDriver driver(app, *result, connection);
+            while (app.isRunning()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        } // Stop the command receiver/state thread BEFORE closing Prism.
 
         connection->close();
         psm::utils::Logger::shutdown();

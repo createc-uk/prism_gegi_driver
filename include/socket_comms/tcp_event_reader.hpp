@@ -68,8 +68,8 @@ namespace phds_gegi_driver::socket_comms {
         bool sendClearData();           // 'c'
         bool sendClearDataAndWindows(); // 'x'
         bool sendToggleBiasMode();      // 'b'
-        bool sendTimedAcquisition(char preset_cmd); // '1'..'5'
-        RunInfo getRunInfo();           // 'r' - requests and parses real/live/dead times + count rate
+        bool sendTimedAcquisition(char preset_cmd); // '1'..'8'
+        RunInfo getRunInfo();           // 'i' - requests and parses real/live/dead times + count rate
         DetectorInfo getDetectorInfo(); // 'd' - requests detector status info
 
         void stopListening();
@@ -88,7 +88,7 @@ namespace phds_gegi_driver::socket_comms {
         double ecal_c1_ = 1.0;
         double ecal_c2_ = 0.0;
 
-        boost::asio::io_service io_service_;
+        boost::asio::io_context io_service_;
 
         Callback1Site callback_1_site_;
 

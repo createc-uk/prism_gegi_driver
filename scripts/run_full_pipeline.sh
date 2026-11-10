@@ -10,9 +10,11 @@ PRISM_PORT="${PRISM_PORT:-4222}"
 DETECTOR_IP="${DETECTOR_IP:-${GEGI_IP:-192.168.50.109}}"
 DETECTOR_PORT="${DETECTOR_PORT:-${GEGI_PORT:-27015}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/data}"
-CALIBRATION_FILE="${CALIBRATION_FILE:-${PROJECT_ROOT}/config/EnergyCal.csv}"
+# ROS devel acquisition/analysis calibration: 15,000 channels at 0.2 keV.
+CALIBRATION_FILE="${CALIBRATION_FILE:-${PROJECT_ROOT}/config/EnergyCal_15000_0p2keV.csv}"
 ISOTOPES_CONFIG="${ISOTOPES_CONFIG:-${PROJECT_ROOT}/config/isotopes.yaml}"
-DRIVER_EXECUTABLE="${DRIVER_EXECUTABLE:-${PROJECT_ROOT}/build/bin/phds_gegi_driver_node}"
+NUCLIDE_LIBRARY="${NUCLIDE_LIBRARY:-${PROJECT_ROOT}/config/nuclide_library.yaml}"
+DRIVER_EXECUTABLE="${DRIVER_EXECUTABLE:-${PROJECT_ROOT}/build/phds_gegi_driver_node}"
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python3}"
 DRIVER_CONFIG="${PROJECT_ROOT}/config/gegi_driver.yaml"
 NODE_DIR="${PROJECT_ROOT}/src/phds_gegi_driver"
@@ -35,6 +37,7 @@ for required_file in \
     "${DRIVER_CONFIG}" \
     "${CALIBRATION_FILE}" \
     "${ISOTOPES_CONFIG}" \
+    "${NUCLIDE_LIBRARY}" \
     "${NODE_DIR}/spectrum_node.py" \
     "${NODE_DIR}/activity_node.py" \
     "${NODE_DIR}/spherical_heatmap_node.py" \
@@ -109,12 +112,18 @@ start_node "activity" \
     "${PYTHON_EXECUTABLE}" "${NODE_DIR}/activity_node.py" \
     "${prism_args[@]}" \
     --isotopes-config "${ISOTOPES_CONFIG}" \
-    --calibration-file "${CALIBRATION_FILE}"
+    --calibration-file "${CALIBRATION_FILE}" \
+    --position-correction
 
 start_node "spherical heatmap" \
     "${PYTHON_EXECUTABLE}" "${NODE_DIR}/spherical_heatmap_node.py" \
     "${prism_args[@]}" \
     --isotopes-config "${ISOTOPES_CONFIG}" \
+    --nuclide-library "${NUCLIDE_LIBRARY}" \
+    --n-points 2000 \
+    --window-s 120 \
+    --peak-min-separation-deg 20 \
+    --support-ratio 0.8 \
     --csv-output-dir "${OUTPUT_DIR}"
 
 start_node "data recorder" \
@@ -122,7 +131,8 @@ start_node "data recorder" \
     "${prism_args[@]}" \
     --output-dir "${OUTPUT_DIR}" \
     --calibration-file "${CALIBRATION_FILE}" \
-    --isotopes-config "${ISOTOPES_CONFIG}"
+    --isotopes-config "${ISOTOPES_CONFIG}" \
+    --nuclide-library "${NUCLIDE_LIBRARY}"
 
 set +e
 wait -n "${child_pids[@]}"

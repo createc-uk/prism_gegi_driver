@@ -3,11 +3,13 @@
 # Energy-scale correction applied to every parsed site energy (keV) before
 # any downstream consumer (spectrum, activity, heatmap, isotope-ID, recorded
 # bags) sees it: corrected = c0 + c1*E + c2*E^2. Defaults 0.0/1.0/0.0 = no
-# correction. Read via psm::utils::Configuration::get() (the same top-level
-# flattened-key mechanism used for connection/endpoint params); --energy-cal-c0
-# /c1/c2 CLI flags take precedence over these.
-energy_cal_c0: 0.0
-energy_cal_c1: 1.0
+# correction. The fitted rig coefficients below are the default. Disable with
+# --energy-cal-c0 0 --energy-cal-c1 1 --energy-cal-c2 0.
+# Explicit CLI flags take precedence over YAML.
+# Fitted ROS devel calibration for the GeGi rig (2026-08-26).
+# Refit if detector hardware is recalibrated; override explicitly by CLI.
+energy_cal_c0: -0.0861
+energy_cal_c1: 0.9994308
 energy_cal_c2: 0.0
 
 endpoints:

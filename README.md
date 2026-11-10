@@ -108,7 +108,7 @@ The old ROS launch XML files have been removed. To run components individually, 
 # Spectrum accumulator
 python3 src/phds_gegi_driver/spectrum_node.py \
   --protocol nats --server localhost --port 4222 \
-  --calibration-file config/EnergyCal.csv
+  --calibration-file config/EnergyCal_15000_0p2keV.csv
 ```
 
 ```bash
@@ -122,7 +122,7 @@ python3 src/phds_gegi_driver/spherical_heatmap_node.py \
 # Per-isotope activity estimator
 python3 src/phds_gegi_driver/activity_node.py \
   --protocol nats --server localhost --port 4222 \
-  --calibration-file config/EnergyCal.csv \
+  --calibration-file config/EnergyCal_15000_0p2keV.csv \
   --isotopes-config config/isotopes.yaml
 ```
 
@@ -130,7 +130,7 @@ python3 src/phds_gegi_driver/activity_node.py \
 # Timed-acquisition recorder
 python3 src/phds_gegi_driver/data_recorder_node.py \
   --protocol nats --server localhost --port 4222 \
-  --calibration-file config/EnergyCal.csv \
+  --calibration-file config/EnergyCal_15000_0p2keV.csv \
   --isotopes-config config/isotopes.yaml \
   --output-dir data
 ```
@@ -217,7 +217,7 @@ For each timed recording, `data_recorder_node.py` writes timestamp-prefixed asse
 
 - `*_compton_events.jsonl`: one raw Compton-event JSON object per line.
 - `*_spectrum.n42`: ANSI N42.42 spectrum data.
-- `*_activity.csv`: isotope activity results.
+- `*_activity.csv`: whole-run detected-line activity summary aligned with the N42 (not per-window measurements; see the migration notes).
 - `*_heatmap_raw.csv`, `*_heatmap_raster.csv`, and `*_heatmap_3d.csv`: imaging products.
 - `*_manifest.json`: measurement identity, configuration, and generated-asset index.
 

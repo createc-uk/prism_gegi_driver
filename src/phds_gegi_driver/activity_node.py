@@ -960,7 +960,8 @@ class ActivityNode(object):
         can distinguish "flushed a real partial window" from "nothing to do".
         """
         with self.lock:
-            has_data = self.accumulated_real_time_ms > 0
+            has_data = (self.accumulated_real_time_ms > 0
+                        or bool(np.any(self.accumulated_spectrum)))
         if not has_data:
             return False, "Nothing accumulated to flush"
         self._compute_and_publish()

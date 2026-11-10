@@ -32,6 +32,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -686,8 +687,9 @@ class DataRecorderNode(object):
         self.total_real_time_ms = 0
         self.total_live_time_ms = 0
         self.heatmap_peaks = []  # list of (x, y, z, isotope, activity)
-        self.heatmap_cloud = None  # latest full point cloud (x, y, z, intensity, cs137, co60)
-        self._latest_cloud_meta = None
+        self.heatmap_cloud = None  # latest verified point cloud (x, y, z, intensity, cs137, co60)
+        self._cloud_meta_by_digest = {}
+        self._cloud_blobs_by_digest = {}
         self.activity_results = []  # list of activity JSON dicts
         self.recording_start = None
         self.duration_minutes = 0
@@ -719,6 +721,15 @@ class DataRecorderNode(object):
         # node clear so a single command resets the whole pipeline.
         self._node_clear_clients = self._build_node_clear_clients(
             app, args, connection, node_clear_targets)
+
+        # End-of-run activity flush must work even with custom clear targets.
+        activity_send_cfg = prism.TextSenderConfig()
+        activity_send_cfg.destination = "gegi.activity.command"
+        activity_recv_cfg = prism.TextReceiverConfig()
+        activity_recv_cfg.source = "gegi.activity.command_result"
+        self._activity_client = CommandClient(
+            app.create_text_sender(args, connection, activity_send_cfg),
+            app.create_text_receiver(args, connection, activity_recv_cfg))
 
         # -- Command channel (replaces the old ~start_timed_recording /
         # ~stop_recording / ~clear_all services) --------------------------
@@ -863,6 +874,7 @@ class DataRecorderNode(object):
         self.sub_distance.stop()
         self.sub_run_info.stop()
         self._detector_client.close()
+        self._activity_client.close()
         for client, _cmd, _topic in self._node_clear_clients:
             client.close()
 
@@ -880,26 +892,35 @@ class DataRecorderNode(object):
     def _handle_start(self, params):
         """Proxy: start timed acquisition on detector + begin recording."""
         duration_minutes = params.get("duration_minutes", 0)
+        if type(duration_minutes) is not int or duration_minutes not in (5, 10, 15, 20, 25, 30, 45, 60):
+            return False, "Unsupported duration. Valid minutes: 5, 10, 15, 20, 25, 30, 45, 60"
 
         with self.lock:
             if self.recording:
                 return False, "Already recording. Wait for current acquisition to finish."
 
-        # Forward to the real detector command channel
+        # Mirror the proven ROS acquisition lifecycle. In particular a data-only
+        # clear ('c') is NOT an acceptable fallback before a measured run:
+        # retained detector energy windows can contaminate the next spectrum.
+        cleared, details = self._handle_clear_all({"require_deep": True})
+        if not cleared:
+            return False, "Pre-acquisition clear failed; detector NOT started: " + details
+        time.sleep(2.0)  # GeGi needs time to settle after the full 'x' clear.
+
         try:
             det_result = self._detector_client.call(
                 {"command": "start_timed_acquisition", "duration_minutes": duration_minutes},
                 timeout=5.0)
             if det_result is None:
-                return False, "Detector command timed out"
+                return False, ("Detector start response timed out. Acquisition state is "
+                               "UNKNOWN; check/stop the detector before retrying.")
             if not det_result.get("success"):
                 return False, "Detector refused: " + det_result.get("message", "")
         except Exception as e:
-            return False, "Failed to publish detector command: " + str(e)
+            return False, "Failed to send detector start command: " + str(e)
 
-        # Start recording
+        # Only start writing a measurement once the detector command was sent.
         self._start_recording(duration_minutes)
-
         return True, "Recording started for {} minutes. Files will be saved to {}".format(
             duration_minutes, self.output_dir)
 
@@ -938,7 +959,10 @@ class DataRecorderNode(object):
 
         # 1) Hardware data buffer (deep clear, with a data-only fallback).
         cleared = False
-        for command in ("clear_data_and_windows", "clear_data"):
+        require_deep = bool(params.get("require_deep", False))
+        commands = ("clear_data_and_windows",) if require_deep else (
+            "clear_data_and_windows", "clear_data")
+        for command in commands:
             try:
                 r = self._detector_client.call({"command": command}, timeout=3.0)
                 ok = bool(r) and bool(r.get("success"))
@@ -986,6 +1010,8 @@ class DataRecorderNode(object):
             self.total_live_time_ms = 0
             self.heatmap_peaks = []
             self.heatmap_cloud = None
+            self._cloud_meta_by_digest.clear()
+            self._cloud_blobs_by_digest.clear()
             self.activity_results = []
             self._timestamp_prefix = timestamp
             # Durable measurement identity, stamped into every asset of this run.
@@ -1005,10 +1031,34 @@ class DataRecorderNode(object):
 
     def _stop_recording(self):
         """Called when the timed acquisition ends. Save all files."""
+        with self.lock:
+            if not self.recording:
+                return
+            activity_count_before = len(self.activity_results)
         logger.info("Timed acquisition complete. Saving data files...")
 
-        # Keep recording flag on briefly to capture any final heatmap/activity publishes
-        # The heatmap node publishes every ~2s; wait one cycle to get final state.
+        # ROS explicitly flushed the final partial activity window while the
+        # recorder was still active. Otherwise a single long activity window
+        # can disappear from N42/CSV even when spectrum capture succeeded.
+        try:
+            result = self._activity_client.call({"command": "flush"}, timeout=3.0)
+            if result is None:
+                logger.warning("Activity flush timed out; final window may be missing")
+            elif result.get("success"):
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    with self.lock:
+                        if len(self.activity_results) > activity_count_before:
+                            break
+                    time.sleep(0.025)
+                else:
+                    logger.warning("Activity flush acknowledged but result not received")
+            elif "Nothing" not in result.get("message", ""):
+                logger.warning("Activity flush failed: %s", result.get("message", ""))
+        except Exception as exc:
+            logger.warning("Could not flush final activity window: %s", exc)
+
+        # Allow the heatmap's ~2s update and any in-flight messages to arrive.
         time.sleep(3.0)
 
         # Stop recording and snapshot totals NOW, BEFORE the run-info settle/fetch.
@@ -1091,7 +1141,8 @@ class DataRecorderNode(object):
         try:
             self._save_activity_csv(prefix, activities, detector_run_info,
                                     real_time_ms, live_time_ms,
-                                    measurement_id, reference_datetime)
+                                    measurement_id, reference_datetime, dt_factor,
+                                    background_rates)
         except Exception as e:
             logger.error("Failed to save activity CSV: %s", e)
 
@@ -1132,6 +1183,8 @@ class DataRecorderNode(object):
             'real_time_sec': float(info.get('real_time_sec', 0.0) or 0.0),
             'live_time_sec': float(info.get('live_time_sec', 0.0) or 0.0),
             'message': info.get('message', ''),
+            'stamp': float(info.get('stamp', 0.0) or 0.0),
+            '_received_monotonic': time.monotonic(),
         }
         with self._run_info_lock:
             self._last_run_info = normalized
@@ -1145,7 +1198,11 @@ class DataRecorderNode(object):
         """
         with self._run_info_lock:
             stored = dict(self._last_run_info)
-        if stored.get('valid') and stored.get('real_time_sec', 0.0) > 0.0:
+        fresh = (stored.get('valid')
+                 and stored.get('real_time_sec', 0.0) > 0.0
+                 and stored.get('stamp', 0.0) >= (self.recording_start or 0)
+                 and 0.0 <= time.monotonic() - stored.get('_received_monotonic', -1e9) <= 90.0)
+        if fresh:
             logger.info("  Detector run info: real=%.3fs live=%.3fs dead=%.3f%%",
                         stored['real_time_sec'], stored['live_time_sec'],
                         stored['dead_time_percent'])
@@ -1287,50 +1344,79 @@ class DataRecorderNode(object):
                     (point.get('x', 0.0), point.get('y', 0.0), point.get('z', 0.0),
                      iso_name, activity))
 
+    @staticmethod
+    def _remember_cloud_frame(store, digest, value, limit=8):
+        """Bound pending cross-topic frames; an absent partner cannot grow RAM."""
+        store[digest] = value
+        while len(store) > limit:
+            store.pop(next(iter(store)))
+
     def _on_cloud_meta(self, message, source=None):
         try:
             meta = json.loads(message)
-        except Exception:
+            digest = meta.get('blob_sha256', '')
+            stamp = float(meta.get('stamp', 0.0))
+            if not isinstance(digest, str) or len(digest) != 64:
+                return
+            int(digest, 16)  # Reject invalid checksums.
+        except (TypeError, ValueError, AttributeError):
             return
+
         with self.lock:
-            self._latest_cloud_meta = meta
+            if not self.recording or stamp < (self.recording_start or 0):
+                return
+            raw = self._cloud_blobs_by_digest.pop(digest, None)
+            if raw is None:
+                self._remember_cloud_frame(self._cloud_meta_by_digest, digest, meta)
+            else:
+                self._decode_cloud_locked(raw, meta)
 
     def _on_cloud(self, data, source=None):
-        """Store the latest sphere heatmap point cloud (overwrite each update)."""
+        """Pair a binary cloud with its EXACT metadata using SHA-256.
+
+        Older frames (no checksum), dropped partners, and delivery reordering
+        cannot accidentally re-label a later point cloud with stale metadata.
+        """
+        raw = bytes(data)
+        digest = hashlib.sha256(raw).hexdigest()
         with self.lock:
             if not self.recording:
                 return
-            meta = self._latest_cloud_meta
+            meta = self._cloud_meta_by_digest.pop(digest, None)
             if meta is None:
-                logger.warning("Received cloud binary before any cloud_meta; skipping")
-                return
+                self._remember_cloud_frame(self._cloud_blobs_by_digest, digest, raw)
+            else:
+                self._decode_cloud_locked(raw, meta)
 
-            fields = meta.get('fields', [])
-            point_step = meta.get('point_step', 28)
-            field_offsets = {name: idx * 4 for idx, name in enumerate(fields)}
-            x_off = field_offsets.get('x', 0)
-            y_off = field_offsets.get('y', 4)
-            z_off = field_offsets.get('z', 8)
-            intensity_off = field_offsets.get('intensity', None)
-            cs137_off = field_offsets.get('cs137', None)
-            co60_off = field_offsets.get('co60', None)
+    def _decode_cloud_locked(self, raw, meta):
+        """Decode a verified metadata/blob pair; caller holds self.lock."""
+        fields = meta.get('fields', [])
+        point_step = meta.get('point_step', 0)
+        n_points = meta.get('n_points', -1)
+        if (not isinstance(fields, list) or
+                not isinstance(point_step, int) or
+                not isinstance(n_points, int) or
+                point_step < 28 or point_step != len(fields) * 4 or
+                n_points < 0 or n_points > 100000 or
+                len(raw) != point_step * n_points or
+                len(raw) != meta.get('byte_length', -1)):
+            logger.warning("Ignoring malformed/mismatched heatmap cloud metadata")
+            return
 
-            raw = data
-            n_points = len(raw) // point_step if point_step > 0 else 0
+        field_offsets = {name: idx * 4 for idx, name in enumerate(fields)}
+        if not all(field in field_offsets for field in ('x', 'y', 'z', 'intensity',
+                                                        'cs137', 'co60')):
+            logger.warning("Ignoring heatmap cloud without required fields")
+            return
 
-            # Columns: x, y, z, intensity, cs137, co60
-            points = np.zeros((n_points, 6), dtype=np.float64)
-            for idx in range(n_points):
-                offset = idx * point_step
-                x = struct.unpack_from('<f', raw, offset + x_off)[0]
-                y = struct.unpack_from('<f', raw, offset + y_off)[0]
-                z = struct.unpack_from('<f', raw, offset + z_off)[0]
-                intensity = struct.unpack_from('<f', raw, offset + intensity_off)[0] if intensity_off is not None else 0.0
-                cs137 = struct.unpack_from('<f', raw, offset + cs137_off)[0] if cs137_off is not None else 0.0
-                co60 = struct.unpack_from('<f', raw, offset + co60_off)[0] if co60_off is not None else 0.0
-                points[idx] = [x, y, z, intensity, cs137, co60]
-
-            self.heatmap_cloud = points
+        points = np.zeros((n_points, 6), dtype=np.float64)
+        for idx in range(n_points):
+            offset = idx * point_step
+            points[idx] = [
+                struct.unpack_from('<f', raw, offset + field_offsets[field])[0]
+                for field in ('x', 'y', 'z', 'intensity', 'cs137', 'co60')
+            ]
+        self.heatmap_cloud = points
 
     def _on_isotopes(self, message, source=None):
         with self.lock:
@@ -1923,79 +2009,59 @@ class DataRecorderNode(object):
 
     def _save_activity_csv(self, prefix, activities, detector_run_info,
                            run_real_time_ms=0, run_live_time_ms=0,
-                           measurement_id="", reference_datetime=""):
-        """Save activity measurement results as CSV.
+                           measurement_id="", reference_datetime="",
+                           dt_factor=1.0, background_rates=None):
+        """Save a RUN-LEVEL activity summary: ONE row per DETECTED line.
 
-        Columns are limited to what activity estimation needs:
-          - live_time_s: PER-window integration time used for the count rate.
-          - run_real_time_s / run_live_time_s: whole-run totals (scan duration).
-          - detector_run_*: authoritative hardware real/live/dead-time for the run.
-        The per-window real_time_s / dead_time_fraction / dead_time_status columns
-        were dropped: with live dead-time polling off they duplicated live_time_s
-        and read a constant zero; the real dead time is in detector_run_*.
+        Each row is the whole-run aggregate (total net / total live, ramp-up
+        windows excluded) - the SAME numbers embedded in the N42 - so a single
+        stable activity per line instead of a per-window series that varies window
+        to window. Undetected lines are NOT written here; they appear once in the
+        N42 as a Currie MDA. A blank run (nothing detected) therefore yields a
+        header-only CSV - read the N42 for its MDAs.
 
-        Provenance columns (measurement_id, measurement_basis, activity_unit,
-        reference_datetime, radionuclide) satisfy spec DB-GEGI-002/004 and
-        DB-ACT-001/002/003 so each processed peak row links to one parent
-        Measurement and never loses its unit/reference-date/basis.
+        Columns are run TOTALS: net_peak_area (raw), net_corrected (x dt_factor),
+        gross/background counts, live time, activity + counting sigma.
+        measurement_id links a stray CSV to its Measurement (spec DB-GEGI-002/004).
         """
         filepath = os.path.join(self.output_dir, "{}_activity.csv".format(prefix))
 
-        run_real_time_s = run_real_time_ms / 1000.0
-        run_live_time_s = run_live_time_ms / 1000.0
+        lines = aggregate_run_activity(activities, dt_factor=dt_factor,
+                                       background_rates=background_rates)
+        drdt = detector_run_info.get('dead_time_percent', 0.0)
+        drcr = detector_run_info.get('count_rate_hz', 0.0)
+        ts = activities[0].get('timestamp', 0) if activities else 0
 
         with open(filepath, 'w') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "timestamp_s", "live_time_s",
-                "detector_run_info_valid", "detector_run_dead_time_percent",
-                "detector_run_real_time_s", "detector_run_live_time_s",
-                "isotope", "energy_keV", "gross_counts", "background_counts",
-                "net_peak_area", "net_corrected", "count_rate_cps",
-                "activity_MBq", "sigma_activity_MBq", "valid",
-                "run_real_time_s", "run_live_time_s",
-                "measurement_id", "radionuclide", "measurement_basis",
-                "activity_unit", "reference_datetime"
+                "timestamp_s", "measurement_id", "isotope", "valid",
+                "live_time_s", "gross_counts", "background_counts",
+                "net_peak_area", "net_corrected", "detector_run_dead_time_percent",
+                "detector_run_count_rate_hz", "activity_MBq", "sigma_activity_MBq"
             ])
 
-            for report in activities:
-                ts = report.get('timestamp', 0)
-                lt = report.get('live_time_s', 0)
-                drv = detector_run_info.get('valid', False)
-                drdt = detector_run_info.get('dead_time_percent', 0.0)
-                drrt = detector_run_info.get('real_time_sec', 0.0)
-                drlt = detector_run_info.get('live_time_sec', 0.0)
+            for label in sorted(lines):
+                r = lines[label]
+                net_raw = r['net_counts']          # raw net (dt not yet applied)
+                writer.writerow([
+                    "{:.3f}".format(ts),
+                    measurement_id,
+                    label,
+                    True,                          # only detected lines are written
+                    "{:.3f}".format(r['live_time_s']),
+                    "{:.0f}".format(r['gross_counts']),
+                    "{:.1f}".format(r['background_counts']),
+                    "{:.1f}".format(net_raw),
+                    "{:.1f}".format(net_raw * dt_factor),
+                    "{:.6f}".format(drdt),
+                    "{:.1f}".format(drcr),
+                    "{:.6f}".format(r['activity_MBq']),
+                    "{:.6f}".format(r['counting_sigma_MBq']),
+                ])
 
-                for iso in report.get('isotopes', []):
-                    iso_name = iso.get('isotope', '')
-                    writer.writerow([
-                        "{:.3f}".format(ts),
-                        "{:.3f}".format(lt),
-                        drv,
-                        "{:.6f}".format(drdt),
-                        "{:.3f}".format(drrt),
-                        "{:.3f}".format(drlt),
-                        iso_name,
-                        "{:.1f}".format(iso.get('energy_keV', 0)),
-                        "{:.0f}".format(iso.get('gross_counts', 0)),
-                        "{:.1f}".format(iso.get('background_counts', 0)),
-                        "{:.1f}".format(iso.get('net_peak_area', 0)),
-                        "{:.1f}".format(iso.get('net_corrected', 0)),
-                        "{:.4f}".format(iso.get('count_rate_cps', 0)),
-                        "{:.6f}".format(iso.get('activity_MBq', 0)),
-                        "{:.6f}".format(iso.get('sigma_activity_MBq', 0)),
-                        iso.get('valid', False),
-                        "{:.3f}".format(run_real_time_s),
-                        "{:.3f}".format(run_live_time_s),
-                        measurement_id,
-                        self._controlled_radionuclide(iso_name),
-                        "direct_measured",
-                        "MBq",
-                        reference_datetime
-                    ])
-
-        logger.info("  Activity CSV saved: %s (%d measurement windows)",
-                    filepath, len(activities))
+        logger.info("  Activity CSV saved: %s (%d detected line(s))",
+                      filepath, len(lines))
 
     def _save_manifest(self, prefix, measurement_id, reference_datetime,
                        duration_minutes, run_real_time_ms, run_live_time_ms,

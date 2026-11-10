@@ -19,7 +19,9 @@ RUN chmod +x /tmp/setup_dependencies.sh \
 FROM base AS builder
 
 ARG DEFAULT_WORKING_DIRECTORY
-ENV WORKING_DIRECTORY=${DEFAULT_WORKING_DIRECTORY}
+# Constrain CMake and Python wheel builds on memory-limited build workers.
+ENV WORKING_DIRECTORY=${DEFAULT_WORKING_DIRECTORY} \
+    CMAKE_BUILD_PARALLEL_LEVEL=3
 
 WORKDIR /build-source
 
@@ -29,22 +31,33 @@ COPY ./CMakeLists.txt ./CMakeLists.txt
 COPY ./include ./include
 COPY ./src ./src
 COPY ./deps ./deps
+# The root CMake project declares this executable even when only the
+# production driver and CLI targets are selected.
+COPY ./test/test_prism_types_coverage.cpp ./test/test_prism_types_coverage.cpp
 
 RUN cmake -S /build-source -B /tmp/phds-gegi-build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_PSM_TOOLS=OFF \
+        -DBUILD_PSM_TOOLS=ON \
         -DNATSMESSAGING_BUILD_TESTS=OFF \
     && cmake --build /tmp/phds-gegi-build \
-        --target phds_gegi_driver_node \
-        --parallel \
+        --target phds_gegi_driver_node prism_cli \
+        --parallel 3 \
     && install -D -m 0755 \
-        /tmp/phds-gegi-build/bin/phds_gegi_driver_node \
-        ${WORKING_DIRECTORY}/bin/phds_gegi_driver_node
+        /tmp/phds-gegi-build/phds_gegi_driver_node \
+        ${WORKING_DIRECTORY}/bin/phds_gegi_driver_node \
+    && install -D -m 0755 \
+        /tmp/phds-gegi-build/bin/prism \
+        ${WORKING_DIRECTORY}/bin/prism
 
 # Prism's pyproject.toml uses scikit-build-core and enables the bindings with
 # PSM_BUILD_PYTHON_BINDINGS=ON. This is the pip installation flow documented by
 # the vendored Prism develop branch.
-RUN python3 -m pip install --no-cache-dir \
+# Jammy's distro python3-packaging (21.x) is incompatible with modern
+# scikit-build-core/pyproject-metadata (requires canonicalize_name(validate)).
+# Upgrade the builder tooling; the runtime retains its stable distro Python.
+RUN python3 -m pip install --no-cache-dir --upgrade \
+        "pip>=24,<27" "packaging>=24,<27" "setuptools>=68" "wheel>=0.43" \
+    && python3 -m pip install --no-cache-dir \
         --target /opt/prism-python \
         /build-source/deps/prism/bindings/python \
     && PYTHONPATH=/opt/prism-python python3 -c "import prism"

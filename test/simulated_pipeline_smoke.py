@@ -6,6 +6,10 @@ hardware. Requires locally installed nats-server, Prism Python bindings,
 the built C++ driver, and the existing Prism CLI. Opt-in; not unittest discover.
 
 Usage: python3 test/simulated_pipeline_smoke.py
+       python3 test/simulated_pipeline_smoke.py --docker
+
+--docker runs the deployed container image, with host networking used only
+for the locally-bound NATS/mock TCP sockets on a Linux development machine.
 """
 import contextlib
 import json
@@ -15,6 +19,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -32,6 +37,14 @@ def unused_port():
         return s.getsockname()[1]
 
 
+def can_connect(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
 def wait_for(predicate, seconds, what, pipeline=None):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -44,10 +57,10 @@ def wait_for(predicate, seconds, what, pipeline=None):
 
 
 class MockGeGi:
-    def __init__(self):
+    def __init__(self, host="127.0.0.1", port=0):
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", 0))
+        self.sock.bind((host, port))
         self.sock.listen(1)
         self.sock.settimeout(0.3)
         self.port = self.sock.getsockname()[1]
@@ -166,8 +179,11 @@ def terminate(proc, group=False):
         proc.wait(timeout=3)
 
 
-def publish(topic, command, port):
-    args = [str(PRISM), "pub", "--protocol", "nats", "--ip",
+def publish(topic, command, port, container_name=None):
+    # In Docker mode, use the Prism CLI bundled IN the image. The host
+    # therefore only needs Docker and Python to run this smoke test.
+    prefix = ["docker", "exec", container_name, "prism"] if container_name else [str(PRISM)]
+    args = prefix + ["pub", "--protocol", "nats", "--ip",
             "127.0.0.1", "--port", str(port), "--topic", topic,
             "--message", json.dumps(command, separators=(",", ":"))]
     run = subprocess.run(args, cwd=ROOT, capture_output=True, text=True,
@@ -177,8 +193,12 @@ def publish(topic, command, port):
 
 
 def main():
-    if not DRIVER.is_file() or not PRISM.is_file():
-        raise RuntimeError("Build the C++ driver and Prism CLI first")
+    docker_mode = '--docker' in sys.argv[1:]
+    if not docker_mode and (not PRISM.is_file() or not DRIVER.is_file()):
+        raise RuntimeError("Build the local Prism CLI and native driver for local mode")
+    if docker_mode:
+        subprocess.run(["docker", "image", "inspect", "prism-gegi-driver:latest"],
+                       capture_output=True, text=True, check=True)
     nats_port = unused_port()
     with tempfile.TemporaryDirectory(prefix="gegi-sim-smoke-") as td:
         data = Path(td) / "data"
@@ -186,13 +206,23 @@ def main():
         nats_log_path = Path(td) / "nats.log"
         pipeline_log_path = Path(td) / "pipeline.log"
         nats = pipeline = None
+        container_name = "gegi-docker-smoke-{}".format(os.getpid())
+        nats_container_name = "gegi-docker-nats-smoke-{}".format(os.getpid())
         with MockGeGi() as sim, open(nats_log_path, "w") as nlog, open(
                 pipeline_log_path, "w") as plog:
             try:
+                if docker_mode:
+                    nats_command = [
+                        "docker", "run", "--rm", "--network", "host",
+                        "--name", nats_container_name, "nats:2-alpine",
+                        "-a", "127.0.0.1", "-p", str(nats_port)]
+                else:
+                    nats_command = ["nats-server", "-a", "127.0.0.1",
+                                    "-p", str(nats_port)]
                 nats = subprocess.Popen(
-                    ["nats-server", "-a", "127.0.0.1", "-p", str(nats_port)],
-                    stdout=nlog, stderr=subprocess.STDOUT, cwd=ROOT)
-                wait_for(lambda: nats.poll() is None, 3, "NATS process")
+                    nats_command, stdout=nlog, stderr=subprocess.STDOUT, cwd=ROOT)
+                wait_for(lambda: can_connect("127.0.0.1", nats_port),
+                         10, "NATS listener", nats)
 
                 env = dict(os.environ)
                 env.update(
@@ -204,11 +234,27 @@ def main():
                     # threads per process and exhaust the entire job cgroup.
                     OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1",
                     MKL_NUM_THREADS="1")
+                if docker_mode:
+                    env_to_pass = (
+                        "PRISM_PROTOCOL", "PRISM_SERVER", "PRISM_PORT",
+                        "DETECTOR_IP", "DETECTOR_PORT",
+                        "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+                        "MKL_NUM_THREADS")
+                    command = [
+                        "docker", "run", "--rm", "--init",
+                        "--network", "host", "--name", container_name,
+                        "-v", "{}:/opt/phds_gegi_driver/data".format(data),
+                    ]
+                    for name in env_to_pass:
+                        command.extend(["-e", "{}={}".format(name, env[name])])
+                    command.append("prism-gegi-driver:latest")
+                else:
+                    command = ["bash", str(LAUNCHER)]
                 pipeline = subprocess.Popen(
-                    ["bash", str(LAUNCHER)], stdout=plog,
-                    stderr=subprocess.STDOUT, env=env, cwd=ROOT,
-                    start_new_session=True)
-                wait_for(sim.accepted.is_set, 8, "simulated TCP connection", pipeline)
+                    command, stdout=plog, stderr=subprocess.STDOUT,
+                    env=env, cwd=ROOT, start_new_session=True)
+                wait_for(sim.accepted.is_set, 18 if docker_mode else 8,
+                         "simulated TCP connection", pipeline)
                 # Wait for recorder and downstream subscriptions to start.
                 time.sleep(5.0)
                 with sim.lock:
@@ -219,7 +265,8 @@ def main():
                 # first run-info request. Do not assert exact startup ordering.
                 publish("gegi.data_recorder.command", {
                     "command": "start_timed_recording", "duration_minutes": 5,
-                    "request_id": "smoke-start-01"}, nats_port)
+                    "request_id": "smoke-start-01"}, nats_port,
+                        container_name if docker_mode else None)
                 wait_for(lambda: "1" in sim.commands, 16,
                          "deep clear then start timed acquisition", pipeline)
                 with sim.lock:
@@ -229,7 +276,8 @@ def main():
                 time.sleep(7.0)
                 publish("gegi.data_recorder.command", {
                     "command": "stop_recording",
-                    "request_id": "smoke-stop-01"}, nats_port)
+                    "request_id": "smoke-stop-01"}, nats_port,
+                        container_name if docker_mode else None)
                 wait_for(lambda: bool(list(data.glob("*_manifest.json"))), 30,
                          "N42/CSV/manifest output", pipeline)
                 n42 = list(data.glob("*.n42"))
@@ -264,7 +312,8 @@ def main():
                     raise RuntimeError("A pipeline node emitted a Python traceback")
                 # A write-side acknowledgement is not a physical detector ACK;
                 # this test validates only the software path, not real hardware.
-                print("PASS: isolated NATS, fake TCP GeGi, all six pipeline nodes")
+                print("PASS: {} pipeline, isolated NATS and fake TCP GeGi".format(
+                    "Docker container" if docker_mode else "native six-node"))
                 print("PASS: full clear preceded timed start, followed by early stop")
                 print("PASS: Compton JSONL, N42, activity CSV, measurement manifest")
                 print(f"Detected commands: {''.join(final_commands)}")
@@ -289,9 +338,32 @@ def main():
                     pass
                 raise
             finally:
+                if docker_mode:
+                    subprocess.run(["docker", "stop", "--time", "5", container_name],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=15)
                 terminate(pipeline, group=True)
+                if docker_mode:
+                    subprocess.run(["docker", "rm", "-f", container_name],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=15)
+                if docker_mode:
+                    subprocess.run(["docker", "stop", "--time", "5", nats_container_name],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=15)
                 terminate(nats)
+                if docker_mode:
+                    subprocess.run(["docker", "rm", "-f", nats_container_name],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=15)
 
 
 if __name__ == "__main__":
-    main()
+    if "--mock-server" in sys.argv:
+        # Used by the Compose-only verification override on an isolated
+        # private Docker network. Never publish the fake detector's port.
+        with MockGeGi(host="0.0.0.0", port=27015) as simulator:
+            print("Mock GeGi ready on TCP port 27015", flush=True)
+            simulator.thread.join()
+    else:
+        main()

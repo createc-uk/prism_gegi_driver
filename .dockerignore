@@ -28,3 +28,25 @@ docker-compose.yml
 
 # Mac
 **/.DS_Store
+
+
+# Do not send local builds, source control, runtime outputs or venvs
+# into the Docker build context. Dependencies in ./deps stay included.
+.git
+**/.git
+build/
+cmake-build-*/
+data/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+*.log
+*.n42
+*.jsonl
+
+
+# Avoid forwarding local Compose environment/secrets into build context
+.env
+.env.*
+*.env

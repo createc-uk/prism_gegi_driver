@@ -123,6 +123,14 @@ communicate with any real detector. The temporary measurement outputs are
 checked for a nonempty Compton log, nonzero N42 channel counts, CSV, valid
 manifest asset links and response decoding, and deleted afterward.
 
+The `python3 test/simulated_pipeline_smoke.py --docker` variant tests the
+packaged Docker image. The stronger Compose topology check is
+`python3 test/docker_compose_smoke.py`, which runs
+`docker-compose.yml` plus `test/docker-compose.mock.yml` with a private
+fake detector container and a loopback-only host NATS port. It verifies that
+the published image, Compose service discovery, full pipeline and bind-mounted
+output directory work together without real GeGi hardware.
+
 **Still requires supervised detector verification:** whether deep-clear
 actually resets onboard windows, firmware-specific responses, live-time
 completion under dead time, high-rate TCP parsing and full end-to-end assay
@@ -582,7 +590,7 @@ docker run --rm -d --name gegi-nats -p 4222:4222 nats:latest
 Pass the driver configuration with:
 
 ```bash
-./build/bin/phds_gegi_driver_node \
+./build/phds_gegi_driver_node \
   --protocol nats --server localhost --port 4222 \
   --config-file config/gegi_driver.yaml \
   --gegi-ip 192.168.50.109 --gegi-port 27015
@@ -605,7 +613,7 @@ Pass the driver configuration with:
 | `CALIBRATION_FILE` | `<project>/config/EnergyCal_15000_0p2keV.csv` |
 | `NUCLIDE_LIBRARY` | `<project>/config/nuclide_library.yaml` |
 | `ISOTOPES_CONFIG` | `<project>/config/isotopes.yaml` |
-| `DRIVER_EXECUTABLE` | `<project>/build/bin/phds_gegi_driver_node` |
+| `DRIVER_EXECUTABLE` | `<project>/build/phds_gegi_driver_node` (native); overridden by image to `/opt/phds_gegi_driver/bin/phds_gegi_driver_node` |
 | `PYTHON_EXECUTABLE` | `python3` |
 
 The launcher always passes `<project>/config/gegi_driver.yaml` as the driver config. Its default driver executable matches the top-level CMake output at `build/bin/phds_gegi_driver_node`. The Docker image overrides `DRIVER_EXECUTABLE` with `/opt/phds_gegi_driver/bin/phds_gegi_driver_node`.

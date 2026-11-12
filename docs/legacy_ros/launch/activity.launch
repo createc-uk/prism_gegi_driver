@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Activity computation node -->
+    <arg name="calibration_file" default="$(find phds_gegi_driver)/config/EnergyCal_15000_0p2keV.csv"/>
+    <arg name="isotopes_config" default="$(find phds_gegi_driver)/config/isotopes.yaml"/>
+    <!-- Counting window length. 300 s => a typical 5-min run is ONE window (one
+         activity row per run); the recorder flushes the final partial window at
+         stop so no tail is lost. Lower it (e.g. 60) for intra-run time resolution. -->
+    <arg name="counting_window_s" default="300.0"/>
+    <arg name="spectrum_topic" default="/spectrum"/>
+    <!-- Geometric solid angle fraction for tray geometry (0 = use config file value) -->
+    <arg name="solid_angle_fraction" default="0.0"/>
+    <!-- Initial number of in-line shielding plates (0 = none). Change at runtime
+         by publishing std_msgs/Int32 to /activity/n_shielding_plates. Geometry
+         (standoff, plate thickness, per-line attenuation) is set in isotopes.yaml. -->
+    <arg name="n_shielding_plates" default="0"/>
+    <!-- Position-aware correction: use the Compton imager's hotspot position to
+         evaluate the solid angle (and slant shield path) off-axis instead of
+         assuming the source sits on the detector axis. Default ON since the
+         2026-09-03 validation: 5-position Exp E repeat (centre + 4 corners)
+         all landed within +-1% of the decay-corrected certificate, position
+         RSD 0.65% (was 6.9% uncorrected, corners -8..-17%). Geometry model =
+         inverse square, (d0/d')^2 - measured best (corner proof: slant
+         distance alone recovered the cert to +1.6%); override the exponent
+         via the node's ~position_geometry_exponent param if ever needed.
+         If disabled, raise assay_systematic_uncertainty_percent (data
+         recorder) back to ~10.6 - the budget assumes this correction. -->
+    <arg name="position_correction" default="true"/>
+
+    <node name="activity" pkg="phds_gegi_driver" type="activity_node.py" output="screen">
+        <param name="calibration_file" value="$(arg calibration_file)"/>
+        <param name="isotopes_config" value="$(arg isotopes_config)"/>
+        <param name="counting_window_s" value="$(arg counting_window_s)"/>
+        <param name="spectrum_topic" value="$(arg spectrum_topic)"/>
+        <param name="solid_angle_fraction" value="$(arg solid_angle_fraction)"/>
+        <param name="n_shielding_plates" value="$(arg n_shielding_plates)"/>
+        <param name="position_correction" value="$(arg position_correction)"/>
+        <param name="publish_on_window" value="true"/>
+    </node>
+</launch>

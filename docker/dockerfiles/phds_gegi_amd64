@@ -43,7 +43,7 @@ RUN cmake -S /build-source -B /tmp/phds-gegi-build -G Ninja \
         --target phds_gegi_driver_node prism_cli \
         --parallel 3 \
     && install -D -m 0755 \
-        /tmp/phds-gegi-build/bin/phds_gegi_driver_node \
+        /tmp/phds-gegi-build/phds_gegi_driver_node \
         ${WORKING_DIRECTORY}/bin/phds_gegi_driver_node \
     && install -D -m 0755 \
         /tmp/phds-gegi-build/bin/prism \

@@ -14,10 +14,42 @@
 #include <limits>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <cerrno>
+#include <poll.h>
+#include <sys/socket.h>
+#endif
 
 namespace phds_gegi_driver::socket_comms {
 
     namespace {
+        // On Linux, available()==0 is also true after a clean TCP FIN.
+        // A nonblocking peek distinguishes EOF from an idle but live detector
+        // without consuming bytes from the single streaming socket.
+        bool peerHasClosed(boost::asio::ip::tcp::socket &socket) {
+#if defined(__linux__)
+            if (!socket.is_open()) return true;
+            pollfd fd{};
+            fd.fd = socket.native_handle();
+            fd.events = POLLIN | POLLERR | POLLHUP;
+#ifdef POLLRDHUP
+            fd.events |= POLLRDHUP;
+#endif
+            if (::poll(&fd, 1, 0) <= 0) return false;
+            if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+#ifdef POLLRDHUP
+            if (fd.revents & POLLRDHUP) return true;
+#endif
+            if (fd.revents & POLLIN) {
+                char peek = 0;
+                return ::recv(fd.fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+            }
+#else
+            (void)socket;
+#endif
+            return false;
+        }
+
         bool readExactlyWithTimeout(boost::asio::ip::tcp::socket &socket,
                                     char *destination,
                                     size_t bytes_to_read,
@@ -181,19 +213,24 @@ namespace phds_gegi_driver::socket_comms {
     }
 
     TcpEventReader::TcpEventReader(Callback1Site callback_1_site, Callback2Site callback_2_site)
-            : socket_(io_service_),
-                            command_socket_(io_service_),
-              callback_1_site_(std::move(callback_1_site)),
-              callback_2_site_(std::move(callback_2_site)) {}
+            : callback_1_site_(std::move(callback_1_site)),
+              callback_2_site_(std::move(callback_2_site)),
+              socket_(io_service_),
+              command_socket_(io_service_) {}
 
     void TcpEventReader::connect(const std::string &ip, const std::string &port) {
         using namespace boost::asio::ip;
 
+        // Retain the endpoint even when the initial connect fails, so the
+        // monitor thread can reconnect without restarting Prism.
+        ip_ = ip;
+        port_ = port;
+        connected_.store(false);
         std::cout << "Connecting to GeGI at " + ip + ":" + port << "..." << std::endl;
 
         tcp::resolver resolver(io_service_);
-        // Modern Boost.Asio: resolver::query/iterator were removed.
         boost::asio::connect(socket_, resolver.resolve(ip, port));
+        connected_.store(true);
 
         // NOTE: Do NOT open a second TCP connection for commands.
         //
@@ -210,14 +247,38 @@ namespace phds_gegi_driver::socket_comms {
         std::cout << "Connected to GeGI at " + ip + ":" + port << std::endl;
     }
 
-    void TcpEventReader::startListening() {
-        running_.store(true);
+    bool TcpEventReader::tryReconnectOnce() {
+        if (ip_.empty()) return false;
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        boost::system::error_code ignored;
+        socket_.close(ignored);
+        try {
+            boost::asio::ip::tcp::resolver resolver(io_service_);
+            boost::asio::connect(socket_, resolver.resolve(ip_, port_));
+            // Old status frames must never leak into a new connection epoch.
+            have_run_info_.store(false);
+            return true;
+        } catch (const std::exception &ex) {
+            std::cerr << "GeGI reconnect attempt failed: " << ex.what() << std::endl;
+            socket_.close(ignored);
+            return false;
+        }
+    }
 
+    double TcpEventReader::secondsSinceLastEvent() const {
+        const auto last = last_event_steady_ms_.load();
+        if (last < 0) return -1.0;
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return static_cast<double>(now - last) / 1000.0;
+    }
+
+    void TcpEventReader::startListening() {
         if (monitoring_thread_.joinable()) {
             std::cerr << "Error: Trying to start listening on TCP socket when already listening" << std::endl;
             return;
         }
-
+        running_.store(true);
         monitoring_thread_ = std::thread(&TcpEventReader::monitorSocket, this);
     }
 
@@ -286,43 +347,64 @@ namespace phds_gegi_driver::socket_comms {
             return true;
         };
 
+        // Only the monitor reconnects. No acquisition commands are replayed.
+        constexpr int FIRST_BACKOFF_MS = 1000;
+        constexpr int MAX_BACKOFF_MS = 30000;
+        int backoff_ms = FIRST_BACKOFF_MS;
+
         while (running_.load()) {
+            if (!connected_.load()) {
+                // Keep shutdown responsive throughout the backoff interval.
+                for (int waited = 0; running_.load() && waited < backoff_ms; waited += 100)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!running_.load()) break;
+                if (tryReconnectOnce()) {
+                    connected_.store(true);
+                    reconnect_count_.fetch_add(1);
+                    backoff_ms = FIRST_BACKOFF_MS;
+                    stream_buffer.clear();
+                    std::cout << "Reconnected to GeGI at " << ip_ << ":" << port_
+                              << " (reconnect #" << reconnect_count_.load() << ")" << std::endl;
+                } else {
+                    backoff_ms = std::min(backoff_ms * 2, MAX_BACKOFF_MS);
+                }
+                continue;
+            }
+
             std::array<char, 1024> data_in{};
             boost::system::error_code error;
             size_t bytes_read = 0;
-
+            bool idle = false;
             {
                 std::unique_lock<std::mutex> resp_lock(response_mutex_, std::try_to_lock);
                 if (!resp_lock.owns_lock()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     continue;
                 }
-
-                const size_t available = socket_.available(error);
-                if (error) {
-                    std::cerr << "Socket available() failed: " << error.message() << std::endl;
-                    running_.store(false);
-                    return;
-                }
-                if (available == 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    continue;
-                }
-
+                // Serialize access with command sends and reconnect attempts.
                 std::lock_guard<std::mutex> lock(socket_mutex_);
-                bytes_read = socket_.read_some(boost::asio::buffer(data_in), error);
+                if (!connected_.load()) continue;
+                const size_t available = socket_.available(error);
+                if (!error && available == 0) {
+                    if (peerHasClosed(socket_)) error = boost::asio::error::eof;
+                    else idle = true;
+                } else if (!error) {
+                    bytes_read = socket_.read_some(boost::asio::buffer(data_in), error);
+                }
             }
 
-            if (error == boost::asio::error::eof) {
-                std::cerr << "Connection lost" << std::endl;
-                running_.store(false);
-                return;
-            } else if (error) {
-                std::cerr << "Error reading from socket: " << error.message() << std::endl;
+            if (error) {
+                std::cerr << "GeGI link lost (" << error.message()
+                          << "); reconnecting without restarting Prism" << std::endl;
+                connected_.store(false);
+                have_run_info_.store(false);
+                stream_buffer.clear();
                 continue;
             }
-
-            if (bytes_read == 0) continue;
+            if (idle || bytes_read == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
 
             stream_buffer.insert(stream_buffer.end(), data_in.begin(), data_in.begin() + static_cast<long long>(bytes_read));
 
@@ -509,6 +591,12 @@ namespace phds_gegi_driver::socket_comms {
                     }
                 }
 
+                // Count fully-decoded detector packets for health supervision.
+                events_total_.fetch_add(1);
+                last_event_steady_ms_.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+
                 // Consume the packet from the buffer
                 stream_buffer.erase(stream_buffer.begin(), stream_buffer.begin() + static_cast<long long>(pkt_size));
             }
@@ -517,6 +605,7 @@ namespace phds_gegi_driver::socket_comms {
 
     void TcpEventReader::stopListening() {
         running_.store(false);
+        connected_.store(false);
 
         if (monitoring_thread_.joinable()) {
             // Closing the socket unblocks the listener thread's blocking read.
@@ -528,6 +617,7 @@ namespace phds_gegi_driver::socket_comms {
     }
 
     void TcpEventReader::disconnect() {
+        connected_.store(false);
         if (monitoring_thread_.joinable()) {
             throw std::runtime_error("Trying to disconnect from socket when monitoring data off it");
         }
@@ -561,8 +651,8 @@ namespace phds_gegi_driver::socket_comms {
         std::lock_guard<std::mutex> command_lock(command_mutex_);
         boost::asio::ip::tcp::socket *command_channel = command_socket_.is_open() ? &command_socket_ : &socket_;
 
-        if (!command_channel->is_open()) {
-            std::cerr << "Socket not open; cannot send command '" << cmd << "'" << std::endl;
+        if (!connected_.load() || !command_channel->is_open()) {
+            std::cerr << "GeGI TCP link disconnected; rejecting command '" << cmd << "'" << std::endl;
             return false;
         }
 
@@ -577,6 +667,7 @@ namespace phds_gegi_driver::socket_comms {
             return true;
         } catch (const std::exception &ex) {
             std::cerr << "Failed to send command '" << cmd << "': " << ex.what() << std::endl;
+            connected_.store(false);
             return false;
         }
     }
@@ -621,8 +712,8 @@ namespace phds_gegi_driver::socket_comms {
         // arrives within the timeout we return NaN so the caller sees an invalid
         // read (success=false) rather than a stale or wrong-run value.
         RunInfo info;
-        if (!socket_.is_open()) {
-            std::cerr << "Socket not open; cannot request run info" << std::endl;
+        if (!connected_.load() || !socket_.is_open()) {
+            std::cerr << "GeGI link disconnected; run info unavailable" << std::endl;
             info.real_time_sec = std::numeric_limits<double>::quiet_NaN();
             info.live_time_sec = std::numeric_limits<double>::quiet_NaN();
             info.dead_time_percent = std::numeric_limits<double>::quiet_NaN();
@@ -631,7 +722,13 @@ namespace phds_gegi_driver::socket_comms {
         }
 
         const std::uint64_t seq_before = run_info_seq_.load();
-        sendCommand('i');  // prompt only; sendCommand already guards socket_mutex_
+        if (!sendCommand('i')) {
+            info.real_time_sec = std::numeric_limits<double>::quiet_NaN();
+            info.live_time_sec = std::numeric_limits<double>::quiet_NaN();
+            info.dead_time_percent = std::numeric_limits<double>::quiet_NaN();
+            info.count_rate_hz = std::numeric_limits<double>::quiet_NaN();
+            return info;
+        }
 
         // Wait (bounded) for the monitor to parse the reply frame inline.
         const auto deadline = std::chrono::steady_clock::now()
@@ -668,7 +765,7 @@ namespace phds_gegi_driver::socket_comms {
         // implementation held it for 2-6 seconds, delaying clear/start/stop
         // commands beyond their Prism timeouts and losing event bytes.
         DetectorInfo info;
-        if (!socket_.is_open()) return info;
+        if (!connected_.load() || !socket_.is_open()) return info;
 
         const std::uint64_t seq_before = detector_info_seq_.load();
         if (!sendCommand('d')) return info;

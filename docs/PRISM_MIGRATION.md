@@ -136,6 +136,34 @@ actually resets onboard windows, firmware-specific responses, live-time
 completion under dead time, high-rate TCP parsing and full end-to-end assay
 agreement. Passing software tests does not validate radiometric accuracy.
 
+## Parent repository and branch consolidation (2026-11-12)
+
+The active Createc Prism fork was consolidated with both Createc hotfix
+branches and `aliyu-createc/gegi_driver` upstream `devel` (including its
+`main` ancestry). ROS node source, launch files, WSL provisioning, and the
+upstream detector-probe tool are preserved in [`legacy_ros/`](legacy_ros/README.md)
+for reference. They are not built or launched by Prism.
+
+The parent `devel` contribution introduced robust detector-link recovery.
+The active Prism driver ports this functionality rather than reinstating ROS:
+
+- A **single** detector TCP socket is shared by commands and event streaming;
+  the monitor thread reconnects after failed startup or dropped connection,
+  with bounded 1–30 second exponential backoff.
+- An independent `gegi.detector.health` JSON-text topic publishes every ~1 s:
+  `dataType: "DetectorHealth"`, `schema_version: 1`, `stamp`, `connected`,
+  `events_total`, `event_rate_hz`, `last_event_age_sec` (`-1` before any event),
+  and `reconnect_count`.
+- Detector commands are not automatically replayed after reconnection; callers
+  must verify the physical state. A successful command result means its TCP
+  write succeeded, not that the detector positively acknowledged acquisition.
+- Command handlers use request IDs, bounded in-memory deduplication, and
+  trace IDs for recorder→detector correlation; no automated retry on an
+  ambiguous result.
+
+The active driver remains **Prism pub/sub**, not ROS. Separate Docker Compose
+stacks create separate NATS brokers unless explicitly configured to share one.
+
 ## ROS to Prism interface mapping
 
 All JSON rows below are UTF-8 JSON sent through Prism text endpoints unless explicitly marked as plain text or binary. `Spectrum.spectrum` contains **per-publication interval deltas**, not a cumulative histogram.

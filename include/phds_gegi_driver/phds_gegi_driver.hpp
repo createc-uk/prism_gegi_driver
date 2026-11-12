@@ -66,6 +66,8 @@ namespace phds_gegi_driver {
         // contending with the event stream on the single detector TCP link
         // (same rationale as the old ~30s ROS run_info_poll_s default).
         void stateLoop();
+        // Always-on link supervision, independent of run-info polling.
+        void healthLoop();
 
         messages::RunInfo queryRunInfo();
         messages::DetectorInfo queryDetectorInfo();
@@ -80,11 +82,14 @@ namespace phds_gegi_driver {
         std::shared_ptr<psm::SenderInterface<std::string>> run_info_sender_;
         std::shared_ptr<psm::SenderInterface<std::string>> detector_info_sender_;
         std::shared_ptr<psm::SenderInterface<std::string>> dead_time_sender_;
+        std::shared_ptr<psm::SenderInterface<std::string>> health_sender_;
 
         std::unique_ptr<command_channel::CommandServer> command_server_;
 
         std::thread state_thread_;
         std::atomic<bool> state_thread_running_{false};
+        std::thread health_thread_;
+        std::atomic<bool> health_thread_running_{false};
         std::atomic<bool> acquisition_active_{false};
         // The timed presets are LIVE-time limited, not wall-clock limited.
         // Reset busy polling only when the detector reports the live-time target.

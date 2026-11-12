@@ -303,6 +303,31 @@ To start a five-minute acquisition and record all pipeline outputs, subscribe to
 On Windows, `watch_gegi_topics.ps1` opens one Prism CLI watcher per selected text topic. It can run `prism` on the host or inside a running GeGi container; use `Get-Help ./watch_gegi_topics.ps1 -Detailed` or inspect its parameters for target and connection overrides.
 
 
+## Detector connection supervision (upstream devel sync, 2026-11-12)
+
+The Prism driver now publishes a JSON-text health heartbeat on
+`gegi.detector.health` approximately every second, independent of the slower
+run-info polling. Fields include `dataType: "DetectorHealth"`,
+`schema_version: 1`, `stamp`, `connected`, `events_total`, `event_rate_hz`,
+`last_event_age_sec` and `reconnect_count`.
+
+Read it without contacting detector hardware:
+
+```bash
+docker compose exec app prism echo --protocol nats --ip nats --port 4222 --topic gegi.detector.health
+```
+
+The single-stream GeGi TCP reader retries a lost connection with bounded
+exponential backoff (1–30 seconds). It can recover from a missing ImagerPro
+service at startup without restarting Prism, but **never automatically
+reissues acquisition or clear commands after reconnecting**. A reported TCP
+connection does not prove that the detector resumed acquisition. Always
+verify device state before issuing new commands. Only one GeGi driver instance
+should own the detector TCP session at a time.
+
+Upstream ROS-only files from the parent repository are archived under
+`docs/legacy_ros/`; they are not part of the active Prism runtime.
+
 ## Diagnosing missing command acknowledgements
 
 GeGi command topics contain **UTF-8 JSON text**, not a nested \`TextValue\`

@@ -87,14 +87,20 @@ namespace phds_gegi_driver {
             args, connection, makeSenderConfig(app, "detector_info", "gegi.detector.detector_info"));
         dead_time_sender_ = app.createTextSender(
             args, connection, makeSenderConfig(app, "dead_time_percent", "gegi.detector.dead_time_percent"));
+        // Supervisory heartbeat is independent of slower detector run-info
+        // requests and does not send control commands or read the TCP stream.
+        health_sender_ = app.createTextSender(
+            args, connection, makeSenderConfig(app, "health", "gegi.detector.health"));
 
         try {
             tcp_event_reader_.connect(gegi_ip, gegi_port);
-            tcp_event_reader_.startListening();
-        } catch (std::exception &error) {
-            PSM_ERROR("PhdsGegiDriver: Could not start TCP IP socket: {}", error.what());
-            exit(1);
+        } catch (const std::exception &error) {
+            // Ported from upstream/devel: keep Prism running and expose
+            // connected=false while the reader retries with bounded backoff.
+            PSM_WARN("GeGI initial connection failed ({}); reconnecting in background",
+                     error.what());
         }
+        tcp_event_reader_.startListening();
 
         // Command channel (replaces the 5 detector/* ROS services).
         auto commandReceiverConfig = makeReceiverConfig(app, "command", "gegi.detector.command");
@@ -126,15 +132,17 @@ namespace phds_gegi_driver {
         // Background state-publishing loop (run_info / detector_info).
         state_thread_running_ = true;
         state_thread_ = std::thread(&PhdsGegiDriver::stateLoop, this);
+        health_thread_running_ = true;
+        health_thread_ = std::thread(&PhdsGegiDriver::healthLoop, this);
 
         PSM_INFO("Prism PHDS GeGi driver initialised");
     }
 
     PhdsGegiDriver::~PhdsGegiDriver() {
         state_thread_running_ = false;
-        if (state_thread_.joinable()) {
-            state_thread_.join();
-        }
+        health_thread_running_ = false;
+        if (state_thread_.joinable()) state_thread_.join();
+        if (health_thread_.joinable()) health_thread_.join();
         if (command_server_) {
             command_server_->stop();
         }
@@ -457,6 +465,33 @@ namespace phds_gegi_driver {
             out.message = "Detector info response invalid or timed out";
         }
         return out;
+    }
+
+    void PhdsGegiDriver::healthLoop() {
+        std::uint64_t previous_total = tcp_event_reader_.eventsTotal();
+        auto previous_time = std::chrono::steady_clock::now();
+        while (health_thread_running_) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto total = tcp_event_reader_.eventsTotal();
+            const double dt = std::chrono::duration<double>(now - previous_time).count();
+            const double event_rate = dt > 0.0
+                ? static_cast<double>(total - previous_total) / dt : 0.0;
+            nlohmann::json health = {
+                {"dataType", "DetectorHealth"},
+                {"schema_version", 1},
+                {"stamp", nowSeconds()},
+                {"connected", tcp_event_reader_.isConnected()},
+                {"events_total", total},
+                {"event_rate_hz", event_rate},
+                {"last_event_age_sec", tcp_event_reader_.secondsSinceLastEvent()},
+                {"reconnect_count", tcp_event_reader_.reconnectCount()},
+            };
+            health_sender_->send(health.dump());
+            previous_total = total;
+            previous_time = now;
+            for (int i = 0; i < 10 && health_thread_running_; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 
     void PhdsGegiDriver::stateLoop() {

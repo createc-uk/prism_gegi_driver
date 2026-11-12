@@ -52,6 +52,14 @@ namespace phds_gegi_driver::socket_comms {
         void connect(const std::string &ip, const std::string &port);
         void startListening();
 
+        // Health and reconnect state (ported from upstream/devel).
+        // Monitor thread reconnects with bounded backoff; there is still only
+        // ONE streaming session and no automatic hardware acquisition restart.
+        bool isConnected() const { return connected_.load(); }
+        std::uint64_t eventsTotal() const { return events_total_.load(); }
+        std::uint32_t reconnectCount() const { return reconnect_count_.load(); }
+        double secondsSinceLastEvent() const;
+
         // Energy-scale correction applied to every parsed site energy:
         //   E_true = c0 + c1*E + c2*E^2   (default identity).
         // The detector's onboard event-energy calibration reads slightly high
@@ -80,6 +88,7 @@ namespace phds_gegi_driver::socket_comms {
     private:
         void monitorSocket();
         bool sendCommand(char cmd);  // Low-level send
+        bool tryReconnectOnce(); // Called only by monitor thread, no control commands
 
         double correctEnergy(double e_kev) const {
             return ecal_c0_ + ecal_c1_ * e_kev + ecal_c2_ * e_kev * e_kev;
@@ -105,6 +114,13 @@ namespace phds_gegi_driver::socket_comms {
         std::mutex response_mutex_;   // Held during command response reads; monitorSocket waits on this
 
         std::atomic<bool> running_ {false};
+        std::atomic<bool> connected_ {false};
+        std::string ip_;
+        std::string port_;
+        std::atomic<std::uint64_t> events_total_ {0};
+        std::atomic<std::uint32_t> reconnect_count_ {0};
+        // Monotonic milliseconds since last complete event, -1 = never.
+        std::atomic<std::int64_t> last_event_steady_ms_ {-1};
 
         // Latest run-info frame, parsed INLINE by the monitor thread (the sole
         // socket reader) as frames stream past in reply to 'i'. getRunInfo()

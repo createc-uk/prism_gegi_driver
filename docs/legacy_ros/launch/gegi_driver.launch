@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="gegi_ip" default="172.31.1.40"/>
+    <arg name="gegi_port" default="27015"/>
+    <!-- Energy-scale correction E_true = c0 + c1*E + c2*E^2, applied to every
+         parsed site energy in the C++ driver. The detector's onboard event
+         energies read ~0.057% HIGH (+1.0 keV at 1332 keV). Values fitted
+         2026-08-26 from a 10-line Cs-137/Co-60/Eu-152 run (20260826_134921,
+         RMS 0.14 keV over 122-1408 keV) with tools/fit_energy_cal.py.
+         Refit after any detector recalibration; set c0=0, c1=1 to disable. -->
+    <arg name="energy_cal_c0" default="-0.0861"/>
+    <arg name="energy_cal_c1" default="0.9994308"/>
+    <arg name="energy_cal_c2" default="0.0"/>
+
+    <!-- respawn: last line of defence if the node process dies (TCP drops are
+         handled in-process by the reader's auto-reconnect). -->
+    <node name="driver" pkg="phds_gegi_driver" type="phds_gegi_driver_node" output="screen"
+          respawn="true" respawn_delay="5">
+        <param name="gegi_ip" value="$(arg gegi_ip)" />
+        <param name="gegi_port" type="string" value="$(arg gegi_port)" />
+        <param name="event_topic" value="/compton_event" />
+        <param name="energy_topic" value="/energy_deposit" />
+        <param name="health_topic" value="/gegi/health" />
+        <param name="health_period_sec" type="double" value="1.0" />
+        <param name="detector_frame" value="detector" />
+        <param name="energy_cal_c0" type="double" value="$(arg energy_cal_c0)" />
+        <param name="energy_cal_c1" type="double" value="$(arg energy_cal_c1)" />
+        <param name="energy_cal_c2" type="double" value="$(arg energy_cal_c2)" />
+    </node>
+</launch>

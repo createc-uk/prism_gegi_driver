@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="output_dir" default="/opt/phds_gegi_driver/data"/>
+    <arg name="calibration_file" default="$(find phds_gegi_driver)/config/EnergyCal_15000_0p2keV.csv"/>
+    <arg name="isotopes_config" default="$(find phds_gegi_driver)/config/isotopes.yaml"/>
+    <arg name="source_distance_m" default="0.5"/>
+    <arg name="heatmap_grid_res" default="200"/>
+    <arg name="run_info_settle_s" default="15.0"/>
+    <arg name="measurement_id_prefix" default="GEGI"/>
+    <!-- Isotope-ID screening layer: full SNM/IND/NORM library identification of
+         the accumulated spectrum, published on /identified_isotopes (drives the
+         heatmap's dynamic imaging bands) and embedded in the N42. Period of the
+         in-run passes in seconds; 0 disables periodic (end-of-run pass only). -->
+    <arg name="nuclide_library" default="$(find phds_gegi_driver)/config/nuclide_library.yaml"/>
+    <arg name="isotope_id_period_s" default="20.0"/>
+
+    <node name="data_recorder" pkg="phds_gegi_driver" type="data_recorder_node.py" output="screen">
+        <param name="output_dir" value="$(arg output_dir)"/>
+        <param name="calibration_file" value="$(arg calibration_file)"/>
+        <param name="isotopes_config" value="$(arg isotopes_config)"/>
+        <param name="source_distance_m" value="$(arg source_distance_m)"/>
+        <param name="heatmap_grid_res" value="$(arg heatmap_grid_res)"/>
+        <param name="run_info_settle_s" value="$(arg run_info_settle_s)"/>
+        <param name="measurement_id_prefix" value="$(arg measurement_id_prefix)"/>
+        <param name="nuclide_library" value="$(arg nuclide_library)"/>
+        <param name="isotope_id_period_s" value="$(arg isotope_id_period_s)"/>
+    </node>
+</launch>

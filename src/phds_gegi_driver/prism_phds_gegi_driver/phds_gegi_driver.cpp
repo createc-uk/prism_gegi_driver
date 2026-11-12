@@ -55,18 +55,21 @@ namespace phds_gegi_driver {
         busy_poll_interval_sec_ = args["busy-poll-interval-sec"].as<double>();
 
         // Energy-scale correction applied to every parsed site energy (keV):
-        // corrected = c0 + c1*E + c2*E^2. Defaults 0.0/1.0/0.0 = no correction
-        // (ported from upstream's energy_cal_c0/c1/c2 ROS params). CLI flags
-        // take precedence; config/gegi_driver.yaml's top-level energy_cal_c0/
-        // c1/c2 keys (read via Configuration::get(), the same mechanism used
-        // for endpoint overrides) act as the config-file default, following
-        // the same override pattern as detector-frame above.
+        // corrected = c0 + c1*E + c2*E^2. The fitted ROS devel coefficients
+        // are built-in defaults. YAML may override those defaults, while
+        // explicitly provided CLI options have the highest precedence.
         double energy_cal_c0 = args["energy-cal-c0"].as<double>();
         double energy_cal_c1 = args["energy-cal-c1"].as<double>();
         double energy_cal_c2 = args["energy-cal-c2"].as<double>();
-        if (auto v = app.getConfig().get("energy_cal_c0")) energy_cal_c0 = std::stod(*v);
-        if (auto v = app.getConfig().get("energy_cal_c1")) energy_cal_c1 = std::stod(*v);
-        if (auto v = app.getConfig().get("energy_cal_c2")) energy_cal_c2 = std::stod(*v);
+        if (!args.count("energy-cal-c0")) {
+            if (auto v = app.getConfig().get("energy_cal_c0")) energy_cal_c0 = std::stod(*v);
+        }
+        if (!args.count("energy-cal-c1")) {
+            if (auto v = app.getConfig().get("energy_cal_c1")) energy_cal_c1 = std::stod(*v);
+        }
+        if (!args.count("energy-cal-c2")) {
+            if (auto v = app.getConfig().get("energy_cal_c2")) energy_cal_c2 = std::stod(*v);
+        }
         tcp_event_reader_.setEnergyCorrection(energy_cal_c0, energy_cal_c1, energy_cal_c2);
         PSM_INFO("Energy calibration correction: c0={} c1={} c2={}",
                  energy_cal_c0, energy_cal_c1, energy_cal_c2);
@@ -98,7 +101,9 @@ namespace phds_gegi_driver {
         auto commandResultSenderConfig = makeSenderConfig(
             app, "command_result", "gegi.detector.command_result");
         auto commandReceiver = app.createRawTextReceiver(args, connection, commandReceiverConfig);
-        auto commandResultSender = app.createTextSender(
+        // Use the raw sender: the adapter's void send() discards the
+        // underlying transport bool and makes command result loss invisible.
+        auto commandResultSender = app.createRawTextSender(
             args, connection, commandResultSenderConfig);
 
         command_server_ = std::make_unique<command_channel::CommandServer>(commandReceiver, commandResultSender);
@@ -190,7 +195,10 @@ namespace phds_gegi_driver {
         command_channel::CommandResult result;
         result.success = tcp_event_reader_.sendStartAcquisition();
         result.message = result.success ? "Start acquisition command sent" : "Failed to send start acquisition command";
-        if (result.success) acquisition_active_ = true;
+        if (result.success) {
+            timed_target_live_sec_ = 0.0;
+            acquisition_active_ = true;
+        }
         return result;
     }
 
@@ -199,7 +207,10 @@ namespace phds_gegi_driver {
         command_channel::CommandResult result;
         result.success = tcp_event_reader_.sendStopAcquisition();
         result.message = result.success ? "Stop acquisition command sent" : "Failed to send stop acquisition command";
-        if (result.success) acquisition_active_ = false;
+        if (result.success) {
+            timed_target_live_sec_ = 0.0;
+            acquisition_active_ = false;
+        }
         return result;
     }
 
@@ -207,7 +218,12 @@ namespace phds_gegi_driver {
         PSM_INFO("Received clear_data command");
         command_channel::CommandResult result;
         result.success = tcp_event_reader_.sendClearData();
-        result.message = result.success ? "Clear data command sent" : "Failed to send clear data command";
+        result.message = result.success ? "Clear data command sent (no device acknowledgement)"
+                                        : "Failed to send clear data command";
+        if (result.success) {
+            std::lock_guard<std::mutex> lock(run_info_history_mutex_);
+            has_last_valid_run_info_ = false;
+        }
         return result;
     }
 
@@ -216,8 +232,12 @@ namespace phds_gegi_driver {
         command_channel::CommandResult result;
         result.success = tcp_event_reader_.sendClearDataAndWindows();
         result.message = result.success
-            ? "Clear data and windows command sent"
+            ? "Clear data and windows command sent (no device acknowledgement)"
             : "Failed to send clear data and windows command";
+        if (result.success) {
+            std::lock_guard<std::mutex> lock(run_info_history_mutex_);
+            has_last_valid_run_info_ = false;
+        }
         return result;
     }
 
@@ -262,7 +282,10 @@ namespace phds_gegi_driver {
         result.message = result.success
             ? std::to_string(duration_minutes) + "-minute acquisition started"
             : "Failed to send timed acquisition command";
-        if (result.success) acquisition_active_ = true;
+        if (result.success) {
+            timed_target_live_sec_ = static_cast<double>(duration_minutes) * 60.0;
+            acquisition_active_ = true;
+        }
         return result;
     }
 
@@ -348,6 +371,12 @@ namespace phds_gegi_driver {
             }
         }
 
+        // A full detector clear resets the counters; a zero sample also marks
+        // the end of the previous run for the temporal plausibility filter.
+        if (valid && idle_zero) {
+            std::lock_guard<std::mutex> history_lock(run_info_history_mutex_);
+            has_last_valid_run_info_ = false;
+        }
         const bool final_valid = valid && temporally_consistent;
         out.valid = final_valid;
         out.stamp = nowSeconds();
@@ -433,6 +462,13 @@ namespace phds_gegi_driver {
     void PhdsGegiDriver::stateLoop() {
         while (state_thread_running_) {
             const messages::RunInfo run_info = queryRunInfo();
+            const double target = timed_target_live_sec_.load();
+            if (target > 0.0 && run_info.valid
+                && run_info.live_time_sec >= target - 0.5) {
+                timed_target_live_sec_ = 0.0;
+                acquisition_active_ = false;
+                PSM_INFO("Detector timed preset reached {:.0f}s live-time; returning to idle polling", target);
+            }
             nlohmann::json run_info_json = run_info;
             run_info_sender_->send(run_info_json.dump());
 

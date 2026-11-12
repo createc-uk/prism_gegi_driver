@@ -43,7 +43,7 @@ cmake --build build --parallel
 
 The relevant executables are:
 
-- `build/bin/phds_gegi_driver_node`
+- `build/phds_gegi_driver_node`
 - `build/bin/prism`
 
 Optionally install the Prism CLI onto `PATH` with `sudo cmake --install build`; otherwise use `./build/bin/prism` in the examples below.
@@ -99,7 +99,7 @@ The old ROS launch XML files have been removed. To run components individually, 
 
 ```bash
 # Detector TCP driver
-./build/bin/phds_gegi_driver_node \
+./build/phds_gegi_driver_node \
   --protocol nats --server localhost --port 4222 \
   --gegi-ip 192.168.50.109 --gegi-port 27015
 ```
@@ -108,7 +108,7 @@ The old ROS launch XML files have been removed. To run components individually, 
 # Spectrum accumulator
 python3 src/phds_gegi_driver/spectrum_node.py \
   --protocol nats --server localhost --port 4222 \
-  --calibration-file config/EnergyCal.csv
+  --calibration-file config/EnergyCal_15000_0p2keV.csv
 ```
 
 ```bash
@@ -122,7 +122,7 @@ python3 src/phds_gegi_driver/spherical_heatmap_node.py \
 # Per-isotope activity estimator
 python3 src/phds_gegi_driver/activity_node.py \
   --protocol nats --server localhost --port 4222 \
-  --calibration-file config/EnergyCal.csv \
+  --calibration-file config/EnergyCal_15000_0p2keV.csv \
   --isotopes-config config/isotopes.yaml
 ```
 
@@ -130,22 +130,113 @@ python3 src/phds_gegi_driver/activity_node.py \
 # Timed-acquisition recorder
 python3 src/phds_gegi_driver/data_recorder_node.py \
   --protocol nats --server localhost --port 4222 \
-  --calibration-file config/EnergyCal.csv \
+  --calibration-file config/EnergyCal_15000_0p2keV.csv \
   --isotopes-config config/isotopes.yaml \
   --output-dir data
 ```
 
 The launcher also starts the singles spectrum instance on `gegi.spectrum_singles.histogram`. Use each application's `--help` output for additional processing and connection options.
 
-## Docker Compose
+## Docker deployment (recommended for portable operation)
 
-The Compose stack builds the Ubuntu 22.04 runtime image, starts NATS, launches the full pipeline, and persists recorder output in the `gegi-data` volume:
+This repository includes a **self-contained Docker build** of the GeGi C++
+driver, Prism CLI, Python bindings, calibration files and all processing
+nodes. You do **not** need ROS, CMake or Python installed on the deployment PC.
+The only runtime prerequisite is Docker Engine with the Compose v2 plugin.
+The current build has been verified on Linux/amd64; other architectures need
+a separately built image and verification.
+
+Clone with the Prism submodule on a machine that has access to Createc's
+private repositories, then build and run:
 
 ```bash
-docker compose up --build
+git clone --recursive git@github.com:createc-uk/prism_gegi_driver.git
+cd prism_gegi_driver
+mkdir -p data
+DETECTOR_IP=192.168.50.109 DETECTOR_PORT=27015 docker compose up -d --build
 ```
 
-The container must be able to route to the detector IP. Override `DETECTOR_IP`, `DETECTOR_PORT`, or other launcher variables in `docker-compose.yml` or with a Compose override when the site network differs. A driver-only image build is also available through `docker/dockerfiles/phds_gegi_amd64`.
+The Compose stack starts NATS and the six-node GeGi pipeline. Set
+`DETECTOR_IP` and `DETECTOR_PORT` to the detector's reachable network
+address. **Do not run this against hardware before the site test is approved.**
+The detector must be powered, cooled and reachable from the container.
+
+View process logs and stop the system:
+
+```bash
+docker compose logs -f app
+docker compose down
+```
+
+Measurement outputs are ordinary host files in `./data` by default. Override
+with `GEGI_DATA_DIR=/some/host/directory`. Linux bind-mounted files may be
+owned by root because the container currently runs as root.
+
+Commands are plain Prism messages; with Compose you do not need to install
+the CLI on the host. For example:
+
+```bash
+# Live spectrum updates (Ctrl+C quits the observer):
+docker compose exec app prism echo --protocol nats --ip nats --port 4222 \
+  --topic gegi.spectrum.histogram
+
+# Start a five-minute recording; this clears all detector windows and buffers:
+docker compose exec app prism pub --protocol nats --ip nats --port 4222 \
+  --topic gegi.data_recorder.command \
+  --message '{"command":"start_timed_recording","duration_minutes":5}'
+
+# Stop early and save the recording:
+docker compose exec app prism pub --protocol nats --ip nats --port 4222 \
+  --topic gegi.data_recorder.command \
+  --message '{"command":"stop_recording"}'
+```
+
+Watch responses on `gegi.data_recorder.command_result` in another terminal.
+A successful command result means the byte was sent, **not** that hardware
+confirmed its physical state. Recordings also generate N42, activity CSV,
+JSONL, heatmap outputs and a manifest in `./data`.
+
+### Move the image to another computer
+
+Build once on the same CPU architecture as your deployment machine, then
+transfer the image without needing compilers or a live connection to the
+private Prism submodule:
+
+```bash
+docker image save prism-gegi-driver:latest | gzip > prism-gegi-driver.tar.gz
+# On the destination:
+docker image load -i prism-gegi-driver.tar.gz
+```
+
+Copy `docker-compose.yml` and create the destination `data/` directory.
+That Compose file still contains a `build` stanza for source installs;
+`docker compose up -d --no-build` uses the transferred local image.
+NATS is a separate image (`nats:2-alpine`) and must be pulled or exported
+and transferred as well for fully offline deployment.
+
+By default, the exposed NATS port binds only to `127.0.0.1:4222` on the
+host. Change `NATS_HOST_PORT` if another service uses that port. Remote
+connections require `NATS_BIND_ADDR` to be set explicitly and appropriate
+network isolation/authentication; do **not** expose unauthenticated NATS on a
+site network.
+
+For repeatable **hardware-free** verification (Docker and host Python 3
+only), build the image and run:
+
+```bash
+python3 test/docker_compose_smoke.py
+```
+
+This uses `test/docker-compose.mock.yml` as an explicit Compose override,
+runs a fake detector on the **private Compose network**, and tests actual
+NATS service discovery, six-node startup, acquisition commands and durable
+host-mounted N42/CSV/JSONL outputs. The simulator port is not published.
+It automatically removes the temporary containers/network and test data.
+No physical detector is contacted.
+
+Alternatively, `python3 test/simulated_pipeline_smoke.py --docker` validates
+the same image using isolated loopback sockets with Linux host networking.
+The native counterpart is `python3 test/simulated_pipeline_smoke.py`.
 
 ## Prism topics
 
@@ -264,7 +355,7 @@ For each timed recording, `data_recorder_node.py` writes timestamp-prefixed asse
 
 - `*_compton_events.jsonl`: one raw Compton-event JSON object per line.
 - `*_spectrum.n42`: ANSI N42.42 spectrum data.
-- `*_activity.csv`: isotope activity results.
+- `*_activity.csv`: whole-run detected-line activity summary aligned with the N42 (not per-window measurements; see the migration notes).
 - `*_heatmap_raw.csv`, `*_heatmap_raster.csv`, and `*_heatmap_3d.csv`: imaging products.
 - `*_manifest.json`: measurement identity, configuration, and generated-asset index.
 

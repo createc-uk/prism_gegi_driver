@@ -1,18 +1,27 @@
 services:
   nats:
     image: nats:2-alpine
+    # Monitor only inside the container for Compose startup ordering.
+    command: ["-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     ports:
-      - "4222:4222"
+      # Default to loopback; override NATS_BIND_ADDR for LAN clients only
+      # after configuring appropriate authentication and network controls.
+      - "${NATS_BIND_ADDR:-127.0.0.1}:${NATS_HOST_PORT:-4222}:4222"
     restart: unless-stopped
 
   app:
-    container_name: gegi_live
-    image: prism-gegi-driver:latest
+    image: ${GEGI_IMAGE:-prism-gegi-driver:latest}
     build:
       context: .
       dockerfile: docker/dockerfiles/phds_gegi_amd64
     depends_on:
-      - nats
+      nats:
+        condition: service_healthy
     environment:
       PRISM_PROTOCOL: nats
       PRISM_SERVER: nats
@@ -21,8 +30,7 @@ services:
       DETECTOR_IP: ${DETECTOR_IP:-192.168.50.109}
       DETECTOR_PORT: ${DETECTOR_PORT:-27015}
     volumes:
-      - gegi-data:/opt/phds_gegi_driver/data
+      # Plain host files so exported N42/CSV/JSONL can be copied with
+      # the deployment rather than living in an opaque named volume.
+      - ${GEGI_DATA_DIR:-./data}:/opt/phds_gegi_driver/data
     restart: unless-stopped
-
-volumes:
-  gegi-data:

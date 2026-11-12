@@ -1,0 +1,24 @@
+# Add only for hardware-free validation:
+# docker compose -f docker-compose.yml -f test/docker-compose.mock.yml up ...
+# This explicitly overrides the GeGi IP with a container on the private
+# Compose bridge. NO real detector address is used and no fake TCP port
+# is published on the host.
+services:
+  fake-gegi:
+    image: prism-gegi-driver:latest
+    entrypoint: ["python3", "-u", "/tests/simulated_pipeline_smoke.py", "--mock-server"]
+    volumes:
+      - ./test:/tests:ro
+    restart: "no"
+
+  app:
+    environment:
+      DETECTOR_IP: fake-gegi
+      DETECTOR_PORT: "27015"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    depends_on:
+      fake-gegi:
+        condition: service_started
+    restart: "no"

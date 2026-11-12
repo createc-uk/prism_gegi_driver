@@ -23,6 +23,7 @@
 #include <phds_gegi_driver/messages.hpp>
 
 #include <prism/core/sender_interface.hpp>
+#include <prism/core/text_sender.hpp>
 #include <prism/core/text_receiver.hpp>
 #include <prism/utils/logger.hpp>
 
@@ -80,7 +81,7 @@ namespace phds_gegi_driver::command_channel {
     class CommandServer {
     public:
         CommandServer(std::shared_ptr<psm::TextReceiver> commandReceiver,
-                       std::shared_ptr<psm::SenderInterface<std::string>> resultSender)
+                       std::shared_ptr<psm::TextSender> resultSender)
             : commandReceiver_(std::move(commandReceiver)),
               resultSender_(std::move(resultSender)) {
             commandReceiver_->setMessageHandler(
@@ -196,9 +197,13 @@ namespace phds_gegi_driver::command_channel {
                         const std::string &commandName,
                         const std::string &requestId) {
             try {
-                resultSender_->send(payload);
-                PSM_INFO("GeGi detector reply send invoked: command={} request_id={}",
-                         commandName, requestId.empty() ? "<none>" : requestId);
+                if (resultSender_->send(payload)) {
+                    PSM_INFO("GeGi detector reply sent: command={} request_id={}",
+                             commandName, requestId.empty() ? "<none>" : requestId);
+                } else {
+                    PSM_ERROR("GeGi detector reply publication failed: command={} request_id={}",
+                              commandName, requestId.empty() ? "<none>" : requestId);
+                }
             } catch (const std::exception &e) {
                 // Never reexecute a detector action just because its reply failed.
                 PSM_ERROR("GeGi detector reply failed: command={} request_id={} error={}",
@@ -211,7 +216,7 @@ namespace phds_gegi_driver::command_channel {
         std::deque<std::string> completedOrder_;
 
         std::shared_ptr<psm::TextReceiver> commandReceiver_;
-        std::shared_ptr<psm::SenderInterface<std::string>> resultSender_;
+        std::shared_ptr<psm::TextSender> resultSender_;
         std::unordered_map<std::string, Handler> handlers_;
     };
 

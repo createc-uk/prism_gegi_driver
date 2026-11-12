@@ -30,9 +30,10 @@ struct FakeReceiver : psm::TextReceiver {
     }
 };
 
-struct FakeSender : psm::SenderInterface<std::string> {
+struct FakeSender : psm::TextSender {
     std::vector<std::string> replies;
-    void send(const std::string &msg) override { replies.push_back(msg); }
+    bool send(const std::string &msg) override { replies.push_back(msg); return true; }
+    std::string getDestination() const override { return "gegi.diagnostics.command_result"; }
 };
 
 int main() {

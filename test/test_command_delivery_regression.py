@@ -171,11 +171,10 @@ class TestRecorderTracePropagation(unittest.TestCase):
             'request_id':'external-123'
         })
         self.assertTrue(result)
-        self.assertEqual(self.calls, [{
-            'command':'start_timed_acquisition',
-            'duration_minutes':5,
-            'trace_id':'external-123'
-        }])
+        self.assertEqual(self.calls, [
+            {'command':'clear_data_and_windows', 'trace_id':'external-123'},
+            {'command':'start_timed_acquisition','duration_minutes':5, 'trace_id':'external-123'},
+        ])
         self.node._start_recording.assert_called_once_with(5)
 
     def test_stop_propagates_original_id_as_trace_id(self):

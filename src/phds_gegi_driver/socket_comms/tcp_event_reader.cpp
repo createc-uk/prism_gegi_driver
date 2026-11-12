@@ -144,41 +144,40 @@ namespace phds_gegi_driver::socket_comms {
             return false;
         }
 
-        void flushSocketInputBuffer(boost::asio::ip::tcp::socket &socket, size_t max_bytes = 1 << 20) {
-            size_t drained_total = 0;
-            for (;;) {
-                boost::system::error_code error;
-                const size_t available = socket.available(error);
-                if (error) {
-                    std::cerr << "Socket available() failed during flush: "
-                              << error.message() << std::endl;
-                    return;
-                }
-                if (available == 0) {
-                    break;
-                }
-
-                const size_t to_read = std::min<size_t>(available, 4096);
-                std::vector<char> scratch(to_read);
-                const size_t n = socket.read_some(boost::asio::buffer(scratch), error);
-                if (error) {
-                    std::cerr << "Socket read_some() failed during flush: "
-                              << error.message() << std::endl;
-                    return;
-                }
-
-                drained_total += n;
-                if (drained_total >= max_bytes) {
-                    std::cerr << "Socket flush capped at " << drained_total << " bytes" << std::endl;
-                    break;
-                }
+        // The 'd' status reply is a 28-byte frame multiplexed among 44/76/92
+        // byte detector events and 28/32-byte run-info frames. Decode on the
+        // monitor thread ONLY, so status polling never discards detector events.
+        bool tryDecodeDetectorInfo(const char *b, size_t available, DetectorInfo &out) {
+            if (available < 28) return false;
+            DetectorInfo candidate;
+            std::string serial(b, 4);
+            serial.erase(std::find(serial.begin(), serial.end(), '\0'), serial.end());
+            if (serial.empty() || serial.size() > 4
+                || !std::isalpha(static_cast<unsigned char>(serial.front()))) {
+                return false;
             }
-
-            if (drained_total > 0) {
-                std::cout << "Flushed " << drained_total
-                          << " stale bytes before command response read" << std::endl;
+            for (char ch : serial) {
+                if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-') return false;
             }
+            candidate.serial_number = serial;
+            candidate.detector_temp_kelvin = readF64(b + 4, false);
+            candidate.detector_bias_status = readI32(b + 12, false);
+            candidate.line_power_status = readI32(b + 16, false);
+            candidate.batt1_percent = readI32(b + 20, false);
+            candidate.batt2_percent = readI32(b + 24, false);
+            if (!std::isfinite(candidate.detector_temp_kelvin)
+                || candidate.detector_temp_kelvin < -50.0
+                || candidate.detector_temp_kelvin > 200.0
+                || (candidate.detector_bias_status != 0 && candidate.detector_bias_status != 1)
+                || (candidate.line_power_status != 0 && candidate.line_power_status != 1)
+                || candidate.batt1_percent < 0 || candidate.batt1_percent > 100
+                || candidate.batt2_percent < 0 || candidate.batt2_percent > 100) {
+                return false;
+            }
+            out = candidate;
+            return true;
         }
+
     }
 
     TcpEventReader::TcpEventReader(Callback1Site callback_1_site, Callback2Site callback_2_site)
@@ -193,15 +192,8 @@ namespace phds_gegi_driver::socket_comms {
         std::cout << "Connecting to GeGI at " + ip + ":" + port << "..." << std::endl;
 
         tcp::resolver resolver(io_service_);
-        tcp::resolver::query query(ip, port);
-        tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
-
-        try {
-            boost::asio::connect(socket_, endpoint_iterator);
-
-        } catch (const std::exception &ex) {
-            throw;
-        }
+        // Modern Boost.Asio: resolver::query/iterator were removed.
+        boost::asio::connect(socket_, resolver.resolve(ip, port));
 
         // NOTE: Do NOT open a second TCP connection for commands.
         //
@@ -334,10 +326,54 @@ namespace phds_gegi_driver::socket_comms {
 
             stream_buffer.insert(stream_buffer.end(), data_in.begin(), data_in.begin() + static_cast<long long>(bytes_read));
 
-            // Parse variable-length packets from the stream buffer
-            while (stream_buffer.size() >= SINGLE_SITE_BYTES) {
-                // Try to find a valid frame header at current position
+            // Parse variable-length packets from the stream buffer. A run-info
+            // reply can be only 28 or 32 bytes long. Requiring a 44-byte event
+            // before parsing used to strand idle status replies indefinitely
+            // (until another event happened to arrive).
+            constexpr size_t MIN_RUN_INFO_BYTES = 28;
+            while (stream_buffer.size() >= MIN_RUN_INFO_BYTES) {
+                // With <44 bytes, first try a complete run-info reply. A
+                // partially-received event must remain buffered for the next
+                // read rather than having its initial bytes discarded.
+                if (stream_buffer.size() < SINGLE_SITE_BYTES) {
+                    DetectorInfo di;
+                    if (tryDecodeDetectorInfo(stream_buffer.data(), stream_buffer.size(), di)) {
+                        {
+                            std::lock_guard<std::mutex> lk(detector_info_mutex_);
+                            latest_detector_info_ = di;
+                        }
+                        detector_info_seq_.fetch_add(1);
+                        stream_buffer.erase(stream_buffer.begin(), stream_buffer.begin() + 28);
+                        continue;
+                    }
+                    RunInfo ri;
+                    size_t ri_bytes = 0;
+                    if (!tryDecodeRunInfo(stream_buffer.data(), stream_buffer.size(),
+                                          ri, ri_bytes)) {
+                        break;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(run_info_mutex_);
+                        latest_run_info_ = ri;
+                    }
+                    have_run_info_.store(true);
+                    run_info_seq_.fetch_add(1);
+                    stream_buffer.erase(stream_buffer.begin(),
+                                        stream_buffer.begin() + static_cast<long long>(ri_bytes));
+                    continue;
+                }
+                // Try to find a valid event frame header at current position
                 if (!validate_header(0, stream_buffer.size())) {
+                    DetectorInfo di;
+                    if (tryDecodeDetectorInfo(stream_buffer.data(), stream_buffer.size(), di)) {
+                        {
+                            std::lock_guard<std::mutex> lk(detector_info_mutex_);
+                            latest_detector_info_ = di;
+                        }
+                        detector_info_seq_.fetch_add(1);
+                        stream_buffer.erase(stream_buffer.begin(), stream_buffer.begin() + 28);
+                        continue;
+                    }
                     // Not an event header. Before discarding, check for a detector
                     // run-info frame (the 'i' reply) interleaved in the stream and
                     // CAPTURE it inline — so getRunInfo() reads it from here rather
@@ -576,70 +612,6 @@ namespace phds_gegi_driver::socket_comms {
         return sendCommand(preset_cmd);
     }
 
-    // ─── Helpers for command response extraction ───────────────────────────
-    //
-    // The GeGI detector multiplexes event stream data and command responses on
-    // a single TCP connection.  We accumulate all received bytes after sending
-    // a command and scan for the response frame using strong plausibility
-    // checks that exploit the mathematical self-consistency of the response
-    // fields (e.g. dead_time ≈ (1 - live/real) × 100).
-    // ─────────────────────────────────────────────────────────────────────────
-
-    namespace {
-        // Flush, send command, accumulate raw bytes until deadline or max_bytes.
-        std::vector<char> sendAndAccumulateRaw(
-                boost::asio::ip::tcp::socket &socket,
-                char cmd,
-                std::chrono::steady_clock::time_point deadline,
-                size_t max_bytes = 16384) {
-
-            std::cout << "sendAndAccumulateRaw('" << cmd << "'): socket open="
-                      << socket.is_open() << " native=" << socket.native_handle()
-                      << std::endl;
-
-            flushSocketInputBuffer(socket);
-
-            boost::system::error_code write_error;
-            boost::asio::write(socket, boost::asio::buffer(&cmd, 1), write_error);
-            if (write_error) {
-                std::cerr << "sendAndAccumulateRaw: write FAILED: " << write_error.message() << std::endl;
-                return {};
-            }
-            std::cout << "sendAndAccumulateRaw('" << cmd << "'): command sent OK" << std::endl;
-
-            std::vector<char> buffer;
-            buffer.reserve(max_bytes);
-            int poll_count = 0;
-
-            while (std::chrono::steady_clock::now() < deadline && buffer.size() < max_bytes) {
-                boost::system::error_code error;
-                const size_t available = socket.available(error);
-                if (error) {
-                    std::cerr << "sendAndAccumulateRaw: available() error: " << error.message() << std::endl;
-                    break;
-                }
-
-                if (available > 0) {
-                    const size_t to_read = std::min<size_t>(available, 4096);
-                    std::vector<char> chunk(to_read);
-                    const size_t n = socket.read_some(boost::asio::buffer(chunk), error);
-                    if (error) {
-                        std::cerr << "sendAndAccumulateRaw: read_some() error: " << error.message() << std::endl;
-                        break;
-                    }
-                    buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<long long>(n));
-                } else {
-                    poll_count++;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                }
-            }
-
-            std::cout << "sendAndAccumulateRaw('" << cmd << "'): accumulated "
-                      << buffer.size() << " bytes, polled " << poll_count << " times" << std::endl;
-            return buffer;
-        }
-    }
-
     RunInfo TcpEventReader::getRunInfo() {
         // The monitor thread is the SOLE socket reader; it parses run-info frames
         // INLINE as they stream past (see monitorSocket + tryDecodeRunInfo). Here we
@@ -690,137 +662,34 @@ namespace phds_gegi_driver::socket_comms {
     }
 
     DetectorInfo TcpEventReader::getDetectorInfo() {
+        // One socket reader: monitorSocket() extracts status frames inline.
+        // Never flush or consume from the event socket here, and never hold
+        // socket_mutex_ while waiting for the status reply. The previous
+        // implementation held it for 2-6 seconds, delaying clear/start/stop
+        // commands beyond their Prism timeouts and losing event bytes.
         DetectorInfo info;
-        if (!socket_.is_open() && !command_socket_.is_open()) {
-            std::cerr << "Socket not open; cannot request detector info" << std::endl;
-            return info;
+        if (!socket_.is_open()) return info;
+
+        const std::uint64_t seq_before = detector_info_seq_.load();
+        if (!sendCommand('d')) return info;
+
+        const auto deadline = std::chrono::steady_clock::now()
+                              + std::chrono::milliseconds(1500);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (detector_info_seq_.load() != seq_before) {
+                std::lock_guard<std::mutex> lk(detector_info_mutex_);
+                info = latest_detector_info_;
+                std::cout << "Detector Info [inline]: serial=" << info.serial_number
+                          << ", temp=" << info.detector_temp_kelvin << " K"
+                          << ", biasStatus=" << info.detector_bias_status
+                          << ", linePower=" << info.line_power_status
+                          << ", batt1=" << info.batt1_percent << "%"
+                          << ", batt2=" << info.batt2_percent << "%" << std::endl;
+                return info;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-
-        try {
-            std::lock_guard<std::mutex> command_lock(command_mutex_);
-
-            // Detector-info frame layout (28 bytes, little-endian):
-            //   [0..3]   char[4] serial_number (e.g. "G596")
-            //   [4..11]  float64 temperature
-            //   [12..15] int32   bias_status (0 or 1)
-            //   [16..19] int32   line_power_status (0 or 1)
-            //   [20..23] int32   batt1_percent
-            //   [24..27] int32   batt2_percent
-            constexpr size_t FRAME_BYTES = 28;
-
-            auto decode_detector_info = [&](const char *base) {
-                DetectorInfo decoded;
-                std::string serial(base, 4);
-                serial.erase(std::find(serial.begin(), serial.end(), '\0'), serial.end());
-                decoded.serial_number = serial;
-                decoded.detector_temp_kelvin = readF64(base + 4, false);
-                decoded.detector_bias_status = readI32(base + 12, false);
-                decoded.line_power_status = readI32(base + 16, false);
-                decoded.batt1_percent = readI32(base + 20, false);
-                decoded.batt2_percent = readI32(base + 24, false);
-                return decoded;
-            };
-
-            auto plausible_detector_info = [](const DetectorInfo &c) {
-                // Serial must be printable alphanumeric (e.g. "G596")
-                if (c.serial_number.empty() || c.serial_number.size() > 4) return false;
-                for (char ch : c.serial_number) {
-                    if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-')
-                        return false;
-                }
-                // First char should be a letter (detector model prefix)
-                if (!std::isalpha(static_cast<unsigned char>(c.serial_number[0])))
-                    return false;
-                if (!std::isfinite(c.detector_temp_kelvin)) return false;
-                if (c.detector_temp_kelvin < -50.0 || c.detector_temp_kelvin > 200.0) return false;
-                if (c.detector_bias_status != 0 && c.detector_bias_status != 1) return false;
-                if (c.line_power_status != 0 && c.line_power_status != 1) return false;
-                if (c.batt1_percent < 0 || c.batt1_percent > 100) return false;
-                if (c.batt2_percent < 0 || c.batt2_percent > 100) return false;
-                return true;
-            };
-
-            bool found = false;
-            std::vector<char> last_buffer;
-
-            // Use command socket first (receives events + responses), then stream
-            std::vector<std::pair<boost::asio::ip::tcp::socket *, std::string>> channels;
-            if (command_socket_.is_open()) {
-                channels.emplace_back(&command_socket_, "command");
-            }
-            if (socket_.is_open()) {
-                channels.emplace_back(&socket_, "stream");
-            }
-
-            // Command 'd' = "Requests Detector Status Info" (the only valid
-            // form; 'D' is undefined in the GeGI protocol).
-            const std::array<char, 1> cmds{{'d'}};
-            for (const auto &channel : channels) {
-                boost::asio::ip::tcp::socket &response_socket = *channel.first;
-                const bool using_stream_socket = (&response_socket == &socket_);
-
-                std::unique_lock<std::mutex> resp_lock(response_mutex_, std::defer_lock);
-                std::unique_lock<std::mutex> event_lock(socket_mutex_, std::defer_lock);
-                if (using_stream_socket) {
-                    resp_lock.lock();
-                    event_lock.lock();
-                }
-
-                for (char cmd : cmds) {
-                    for (int attempt = 0; attempt < 3 && !found; ++attempt) {
-                        const auto deadline = std::chrono::steady_clock::now()
-                                              + std::chrono::milliseconds(2000);
-                        auto buffer = sendAndAccumulateRaw(
-                            response_socket, cmd, deadline, 16384);
-
-                        // Scan buffer for a valid detector-info frame
-                        if (buffer.size() >= FRAME_BYTES) {
-                            for (size_t i = 0; i + FRAME_BYTES <= buffer.size(); ++i) {
-                                auto candidate = decode_detector_info(buffer.data() + i);
-                                if (plausible_detector_info(candidate)) {
-                                    info = candidate;
-                                    found = true;
-                                    std::cout << "Found detector-info at offset " << i
-                                              << " in " << buffer.size() << " bytes ("
-                                              << channel.second << ")" << std::endl;
-                                    break;
-                                }
-                            }
-                        }
-                        last_buffer = buffer;
-                    }
-                    if (found) break;
-                }
-                if (found) break;
-            }
-
-            if (!found) {
-                std::cerr << "Timed out waiting for valid detector info response" << std::endl;
-                if (!last_buffer.empty()) {
-                    const size_t n = std::min<size_t>(last_buffer.size(), 64);
-                    std::ostringstream oss;
-                    oss << std::hex << std::setfill('0');
-                    for (size_t i = 0; i < n; ++i) {
-                        oss << std::setw(2)
-                            << (static_cast<unsigned int>(
-                                static_cast<unsigned char>(last_buffer[i])));
-                    }
-                    std::cerr << "Detector info debug: captured "
-                              << last_buffer.size() << " bytes, first " << n
-                              << " hex=" << oss.str() << std::endl;
-                }
-            }
-
-            std::cout << "Detector Info: serial=" << info.serial_number
-                      << ", temp=" << info.detector_temp_kelvin << " K"
-                      << ", biasStatus=" << info.detector_bias_status
-                      << ", linePower=" << info.line_power_status
-                      << ", batt1=" << info.batt1_percent << "%"
-                      << ", batt2=" << info.batt2_percent << "%" << std::endl;
-        } catch (const std::exception &ex) {
-            std::cerr << "Failed to get detector info: " << ex.what() << std::endl;
-        }
-
+        std::cerr << "Detector info: no fresh frame within timeout" << std::endl;
         return info;
     }
 

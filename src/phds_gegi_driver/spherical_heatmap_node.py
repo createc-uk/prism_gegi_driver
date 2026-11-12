@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import json
+import hashlib
 import logging
 import struct
 import threading
@@ -1150,15 +1151,22 @@ class SphericalHeatmapNode(object):
             struct.pack_into('f', buf, i * point_step + 20, cs137_scores[i] if color_scores[i] > 0 else 0.0)
             struct.pack_into('f', buf, i * point_step + 24, co60_scores[i] if color_scores[i] > 0 else 0.0)
 
+        # The metadata and binary blob use distinct pub/sub subjects, so
+        # arrival order is not guaranteed. A content digest pairs exactly
+        # the correct metadata with the correct blob without changing Prism's
+        # existing raw cloud payload layout.
+        payload = bytes(buf)
         meta = {
             "stamp": stamp,
             "frame_id": "detector",
             "point_step": point_step,
             "n_points": n,
             "fields": ["x", "y", "z", "rgb", "intensity", "cs137", "co60"],
+            "blob_sha256": hashlib.sha256(payload).hexdigest(),
+            "byte_length": len(payload),
         }
         self.pub_cloud_meta.send(json.dumps(meta))
-        self.pub_cloud.send(bytes(buf))
+        self.pub_cloud.send(payload)
 
 
 def main():

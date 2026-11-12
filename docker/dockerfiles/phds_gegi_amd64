@@ -19,7 +19,9 @@ RUN chmod +x /tmp/setup_dependencies.sh \
 FROM base AS builder
 
 ARG DEFAULT_WORKING_DIRECTORY
-ENV WORKING_DIRECTORY=${DEFAULT_WORKING_DIRECTORY}
+# Constrain CMake and Python wheel builds on memory-limited build workers.
+ENV WORKING_DIRECTORY=${DEFAULT_WORKING_DIRECTORY} \
+    CMAKE_BUILD_PARALLEL_LEVEL=3
 
 WORKDIR /build-source
 
@@ -29,6 +31,7 @@ COPY ./CMakeLists.txt ./CMakeLists.txt
 COPY ./include ./include
 COPY ./src ./src
 COPY ./deps ./deps
+# Include test sources because the root CMake project defines coverage targets.
 COPY ./test ./test
 
 RUN cmake -S /build-source -B /tmp/phds-gegi-build -G Ninja \
@@ -38,7 +41,7 @@ RUN cmake -S /build-source -B /tmp/phds-gegi-build -G Ninja \
         -DNATSMESSAGING_BUILD_TESTS=OFF \
     && cmake --build /tmp/phds-gegi-build \
         --target phds_gegi_driver_node prism_cli \
-        --parallel \
+        --parallel 3 \
     && install -D -m 0755 \
         /tmp/phds-gegi-build/bin/phds_gegi_driver_node \
         ${WORKING_DIRECTORY}/bin/phds_gegi_driver_node \
@@ -49,9 +52,9 @@ RUN cmake -S /build-source -B /tmp/phds-gegi-build -G Ninja \
 # Prism's pyproject.toml uses scikit-build-core and enables the bindings with
 # PSM_BUILD_PYTHON_BINDINGS=ON. This is the pip installation flow documented by
 # the vendored Prism develop branch.
-# Ubuntu 22.04's Python packaging tools predate the metadata API used by
-# current scikit-build-core. Upgrade them before creating its isolated build.
-RUN python3 -m pip install --no-cache-dir --upgrade "pip>=23.3" "packaging>=23.2" \
+# Update the Python binding build toolchain (Ubuntu 22.04 packaging is too old).
+RUN python3 -m pip install --no-cache-dir --upgrade \
+        "pip>=24,<27" "packaging>=24,<27" "setuptools>=68" "wheel>=0.43" \
     && python3 -m pip install --no-cache-dir \
         --target /opt/prism-python \
         /build-source/deps/prism/bindings/python \

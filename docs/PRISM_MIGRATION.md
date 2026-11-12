@@ -71,6 +71,71 @@ Every former service is therefore represented by ordinary pub/sub topics:
 
 The implementation is shared across languages in [`include/phds_gegi_driver/command_channel.hpp`](../include/phds_gegi_driver/command_channel.hpp) and [`src/phds_gegi_driver/prism_command_channel.py`](../src/phds_gegi_driver/prism_command_channel.py).
 
+## 2026-11-10 parity and reliability changes
+
+The launcher now points at the actual CMake output `build/phds_gegi_driver_node`
+(not `build/bin/phds_gegi_driver_node`). The full pipeline now uses the ROS devel 15,000-channel assay calibration,
+position-corrected activity, matched-filter nuclide library and heatmap
+window/grid/support defaults. Override these by providing appropriate CLI
+flags or environment variables if a different calibrated rig requires them.
+
+The recorder performs a GeGi **deep clear** (`x`) plus downstream buffer
+clears before each timed measurement, then waits two seconds before the timed
+command. A failed clear aborts the start. It also asks the activity node to
+flush its final partial counting window before recording snapshots; loss of
+the flush or the publication is logged and must be treated as missing data.
+
+Command results are **not device acknowledgements**: a positive detector
+command result means a vendor command byte was written to the TCP socket,
+not that the detector confirmed it physically completed. A response timeout
+leaves the detector state unknown; operators must reconcile it before retry.
+Commands with the same `request_id` are deduplicated within a running
+process, but the cache is not durable across restarts. This does not provide
+exactly-once execution in the presence of process restarts or network loss.
+
+The heatmap retains its existing binary 28-byte point layout, but metadata
+now carries `blob_sha256` and `byte_length`. The recorder only decodes
+matched metadata/binary pairs; downstream consumers should use these fields
+to prevent reordered-message contamination.
+
+**Compatibility note:** `*_activity.csv` is no longer a per-window table.
+It is a per-run table of detected isotope lines. Consumers needing per-window
+time series must subscribe to `gegi.activity.results` and retain that feed
+separately. Database ingestion should distinguish the two semantics.
+
+Detector run-info and detector-info replies now share the monitor
+thread's **single socket reader**. An earlier detector-info poll independently
+flushed and read the event socket for up to six seconds, which could discard
+events and starve a deep-clear command beyond its three-second deadline.
+Both 28-byte idle/status replies and variable-length event frames are decoded
+inline. The software-only simulator exercises the clear/start/stop path while
+status polling runs concurrently.
+
+Run the optional full-system smoke test (after building the C++ driver and
+Prism CLI and installing the Prism Python bindings and `nats-server`):
+
+```bash
+python3 test/simulated_pipeline_smoke.py
+```
+
+This binds NATS and the fake GeGi **only to 127.0.0.1**; it does not
+communicate with any real detector. The temporary measurement outputs are
+checked for a nonempty Compton log, nonzero N42 channel counts, CSV, valid
+manifest asset links and response decoding, and deleted afterward.
+
+The `python3 test/simulated_pipeline_smoke.py --docker` variant tests the
+packaged Docker image. The stronger Compose topology check is
+`python3 test/docker_compose_smoke.py`, which runs
+`docker-compose.yml` plus `test/docker-compose.mock.yml` with a private
+fake detector container and a loopback-only host NATS port. It verifies that
+the published image, Compose service discovery, full pipeline and bind-mounted
+output directory work together without real GeGi hardware.
+
+**Still requires supervised detector verification:** whether deep-clear
+actually resets onboard windows, firmware-specific responses, live-time
+completion under dead time, high-rate TCP parsing and full end-to-end assay
+agreement. Passing software tests does not validate radiometric accuracy.
+
 ## ROS to Prism interface mapping
 
 All JSON rows below are UTF-8 JSON sent through Prism text endpoints unless explicitly marked as plain text or binary. `Spectrum.spectrum` contains **per-publication interval deltas**, not a cumulative histogram.
@@ -106,6 +171,7 @@ All five detector actions below share `gegi.detector.command` for commands and `
 | `/detector/start_acquisition` | `{"command":"start_acquisition"}` | `gegi.detector.command_result` |
 | `/detector/stop_acquisition` | `{"command":"stop_acquisition"}` | `gegi.detector.command_result` |
 | `/detector/clear_data` | `{"command":"clear_data"}` | `gegi.detector.command_result` |
+| `/detector/clear_data_and_windows` | `{"command":"clear_data_and_windows"}` | `gegi.detector.command_result` |
 | `/detector/toggle_bias_mode` | `{"command":"toggle_bias_mode"}` | `gegi.detector.command_result` |
 | `/detector/start_timed_acquisition` | `{"command":"start_timed_acquisition","duration_minutes":5}` | `gegi.detector.command_result`; supported durations are 5, 10, 15, 20, 25, 30, 45, and 60 minutes. |
 
@@ -468,7 +534,7 @@ A completed recording can generate:
 
 1. `*_compton_events.jsonl` — one `ComptonEvent` JSON object per line.
 2. `*_spectrum.n42` — ANSI N42.42 spectrum with embedded activity analysis where available.
-3. `*_activity.csv` — per-window/per-line activity and provenance fields.
+3. `*_activity.csv` — **run-level detected lines only**, activity, counting uncertainty, dead-time/background-corrected net areas and measurement ID; aligned with N42 values (breaking row-granularity change from earlier Prism output).
 4. `*_heatmap_raw.csv` — filtered irregular sphere points.
 5. `*_heatmap_raster.csv` — regular Y-Z raster.
 6. `*_heatmap_3d.csv` — source-plane hot-point grid.
@@ -524,7 +590,7 @@ docker run --rm -d --name gegi-nats -p 4222:4222 nats:latest
 Pass the driver configuration with:
 
 ```bash
-./build/bin/phds_gegi_driver_node \
+./build/phds_gegi_driver_node \
   --protocol nats --server localhost --port 4222 \
   --config-file config/gegi_driver.yaml \
   --gegi-ip 192.168.50.109 --gegi-port 27015
@@ -544,9 +610,10 @@ Pass the driver configuration with:
 | `DETECTOR_IP` | `GEGI_IP` if set, otherwise `192.168.50.109` |
 | `DETECTOR_PORT` | `GEGI_PORT` if set, otherwise `27015` |
 | `OUTPUT_DIR` | `<project>/data` |
-| `CALIBRATION_FILE` | `<project>/config/EnergyCal.csv` |
+| `CALIBRATION_FILE` | `<project>/config/EnergyCal_15000_0p2keV.csv` |
+| `NUCLIDE_LIBRARY` | `<project>/config/nuclide_library.yaml` |
 | `ISOTOPES_CONFIG` | `<project>/config/isotopes.yaml` |
-| `DRIVER_EXECUTABLE` | `<project>/build/bin/phds_gegi_driver_node` |
+| `DRIVER_EXECUTABLE` | `<project>/build/phds_gegi_driver_node` (native); overridden by image to `/opt/phds_gegi_driver/bin/phds_gegi_driver_node` |
 | `PYTHON_EXECUTABLE` | `python3` |
 
 The launcher always passes `<project>/config/gegi_driver.yaml` as the driver config. Its default driver executable matches the top-level CMake output at `build/bin/phds_gegi_driver_node`. The Docker image overrides `DRIVER_EXECUTABLE` with `/opt/phds_gegi_driver/bin/phds_gegi_driver_node`.

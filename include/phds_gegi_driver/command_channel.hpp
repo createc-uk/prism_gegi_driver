@@ -31,6 +31,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -100,31 +101,114 @@ namespace phds_gegi_driver::command_channel {
         void handleMessage(const std::string &message) {
             std::string commandName;
             std::string requestId;
-            CommandResult result;
+            nlohmann::json params;
             try {
-                auto j = nlohmann::json::parse(message);
-                commandName = j.value("command", std::string());
-                requestId = j.value("request_id", std::string());
-
-                auto it = handlers_.find(commandName);
-                if (it == handlers_.end()) {
-                    result.success = false;
-                    result.message = "Unknown command: " + commandName;
-                } else {
-                    result = it->second(j);
+                params = nlohmann::json::parse(message);
+                if (!params.is_object()) {
+                    throw std::invalid_argument("command must be a JSON object");
+                }
+                commandName = params.value("command", std::string());
+                requestId = params.value("request_id", std::string());
+                if (commandName.empty()) {
+                    throw std::invalid_argument("command must be a non-empty string");
                 }
             } catch (const std::exception &e) {
-                result.success = false;
-                result.message = std::string("Malformed command message: ") + e.what();
+                PSM_WARN("Malformed GeGi detector command: {}", e.what());
+                CommandResult malformed;
+                malformed.command = commandName;
+                malformed.request_id = requestId;
+                malformed.message = std::string("Malformed command message: ") + e.what();
+                malformed.stamp = messages::nowSeconds();
+                nlohmann::json reply = malformed;
+                sendResult(reply.dump(), commandName, requestId);
+                return;
             }
 
-            result.command = commandName;
-            result.request_id = requestId;
-            result.stamp = messages::nowSeconds();
+            const std::string traceId =
+                (params.contains("trace_id") && params["trace_id"].is_string())
+                    ? params["trace_id"].get<std::string>() : std::string();
+            PSM_INFO("GeGi detector command received: command={} request_id={} trace_id={}",
+                     commandName, requestId.empty() ? "<none>" : requestId,
+                     traceId.empty() ? "<none>" : traceId);
 
-            nlohmann::json outJson = result;
-            resultSender_->send(outJson.dump());
+            std::string serializedResult;
+            {
+                // Process-wide at-most-once dispatch for each request_id.
+                // Protects against accidental duplicate command publishes, not
+                // process restarts or uncertain hardware TCP acknowledgement.
+                std::lock_guard<std::mutex> lock(dispatchMutex_);
+                const auto prior = requestId.empty() ? completed_.end()
+                                                     : completed_.find(requestId);
+                if (prior != completed_.end()) {
+                    if (prior->second.first == commandName) {
+                        PSM_WARN("GeGi command duplicate; reusing reply: command={} request_id={}",
+                                 commandName, requestId);
+                        serializedResult = prior->second.second;
+                    } else {
+                        CommandResult conflict;
+                        conflict.command = commandName;
+                        conflict.request_id = requestId;
+                        conflict.message = "request_id already used for another command";
+                        conflict.stamp = messages::nowSeconds();
+                        nlohmann::json reply = conflict;
+                        serializedResult = reply.dump();
+                    }
+                } else {
+                    CommandResult result;
+                    try {
+                        auto it = handlers_.find(commandName);
+                        if (it == handlers_.end()) {
+                            result.message = "Unknown command: " + commandName;
+                        } else {
+                            result = it->second(params);
+                        }
+                    } catch (const std::exception &e) {
+                        PSM_ERROR("GeGi detector command handler error: command={} request_id={} error={}",
+                                  commandName, requestId, e.what());
+                        result.success = false;
+                        result.message = "Command handler failed; inspect driver logs";
+                    } catch (...) {
+                        PSM_ERROR("GeGi detector command handler error: command={} request_id={}",
+                                  commandName, requestId);
+                        result.success = false;
+                        result.message = "Command handler failed; inspect driver logs";
+                    }
+                    result.command = commandName;
+                    result.request_id = requestId;
+                    result.stamp = messages::nowSeconds();
+                    nlohmann::json reply = result;
+                    serializedResult = reply.dump();
+
+                    if (!requestId.empty()) {
+                        completed_[requestId] = {commandName, serializedResult};
+                        completedOrder_.push_back(requestId);
+                        if (completedOrder_.size() > 1024) {
+                            completed_.erase(completedOrder_.front());
+                            completedOrder_.pop_front();
+                        }
+                    }
+                }
+            }
+            sendResult(serializedResult, commandName, requestId);
         }
+
+        void sendResult(const std::string &payload,
+                        const std::string &commandName,
+                        const std::string &requestId) {
+            try {
+                resultSender_->send(payload);
+                PSM_INFO("GeGi detector reply send invoked: command={} request_id={}",
+                         commandName, requestId.empty() ? "<none>" : requestId);
+            } catch (const std::exception &e) {
+                // Never reexecute a detector action just because its reply failed.
+                PSM_ERROR("GeGi detector reply failed: command={} request_id={} error={}",
+                          commandName, requestId, e.what());
+            }
+        }
+
+        std::mutex dispatchMutex_;
+        std::unordered_map<std::string, std::pair<std::string, std::string>> completed_;
+        std::deque<std::string> completedOrder_;
 
         std::shared_ptr<psm::TextReceiver> commandReceiver_;
         std::shared_ptr<psm::SenderInterface<std::string>> resultSender_;

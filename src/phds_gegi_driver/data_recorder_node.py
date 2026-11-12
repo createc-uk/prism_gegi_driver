@@ -887,9 +887,13 @@ class DataRecorderNode(object):
 
         # Forward to the real detector command channel
         try:
-            det_result = self._detector_client.call(
-                {"command": "start_timed_acquisition", "duration_minutes": duration_minutes},
-                timeout=5.0)
+            detector_command = {
+                "command": "start_timed_acquisition",
+                "duration_minutes": duration_minutes,
+            }
+            if isinstance(params.get("request_id"), str) and params["request_id"]:
+                detector_command["trace_id"] = params["request_id"]
+            det_result = self._detector_client.call(detector_command, timeout=5.0)
             if det_result is None:
                 return False, "Detector command timed out"
             if not det_result.get("success"):
@@ -913,7 +917,10 @@ class DataRecorderNode(object):
             self.timer.cancel()
         # Also stop the detector acquisition
         try:
-            result = self._detector_client.call({"command": "stop_acquisition"}, timeout=5.0)
+            detector_command = {"command": "stop_acquisition"}
+            if isinstance(params.get("request_id"), str) and params["request_id"]:
+                detector_command["trace_id"] = params["request_id"]
+            result = self._detector_client.call(detector_command, timeout=5.0)
             if result is None or not result.get("success"):
                 logger.warning("Could not stop detector acquisition (may already be stopped)")
         except Exception:
@@ -940,7 +947,10 @@ class DataRecorderNode(object):
         cleared = False
         for command in ("clear_data_and_windows", "clear_data"):
             try:
-                r = self._detector_client.call({"command": command}, timeout=3.0)
+                detector_command = {"command": command}
+                if isinstance(params.get("request_id"), str) and params["request_id"]:
+                    detector_command["trace_id"] = params["request_id"]
+                r = self._detector_client.call(detector_command, timeout=3.0)
                 ok = bool(r) and bool(r.get("success"))
                 results.append("{}:{}:{}".format(
                     DETECTOR_COMMAND_TOPIC, command, "ok" if ok else "fail"))

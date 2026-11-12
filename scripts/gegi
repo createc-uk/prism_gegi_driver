@@ -128,16 +128,18 @@ def request(topic, payload, timeout):
     sender_cfg.destination = topic
     sender = app.create_text_sender(options, conn, sender_cfg)
     try:
+        print('Prism command: topic=%s command=%s request_id=%s' % (
+            topic, payload.get('command', ''), payload['request_id']), flush=True)
         if sender.send(json.dumps(payload)) is False:
             raise RuntimeError('Prism could not send command')
         if not event.wait(timeout):
-            raise RuntimeError('No acknowledgement on %s_result after %gs. Outcome unknown; check logs before retrying.' % (topic, timeout))
+            raise RuntimeError('No acknowledgement on %s_result after %gs (request_id=%s). Outcome unknown; check logs before retrying.' % (topic, timeout, payload['request_id']))
         reply = replies[0]
         if progress is not None and reply.get('success'):
             print('Command accepted. Waiting for detector data or advancing acquisition time...', flush=True)
             if not progress.ready.wait(timeout):
-                raise RuntimeError('Command accepted, but acquisition was NOT verified: no energy events or advancing run time. '
-                                   'Recorder may still be active. Run `gegi logs` to inspect the driver; do not blindly retry.')
+                raise RuntimeError('Command accepted, but acquisition was NOT verified (request_id=%s): no energy events or advancing run time. '
+                                   'Recorder may still be active. Run `gegi logs` to inspect the driver; do not blindly retry.' % payload['request_id'])
             print('Detector acquisition progress observed.', flush=True)
         print(('OK: ' if reply.get('success') else 'FAILED: ') + reply.get('message', str(reply)), flush=True)
         return 0 if reply.get('success') else 1

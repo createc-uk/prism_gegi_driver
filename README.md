@@ -211,6 +211,53 @@ To start a five-minute acquisition and record all pipeline outputs, subscribe to
 
 On Windows, `watch_gegi_topics.ps1` opens one Prism CLI watcher per selected text topic. It can run `prism` on the host or inside a running GeGi container; use `Get-Help ./watch_gegi_topics.ps1 -Detailed` or inspect its parameters for target and connection overrides.
 
+
+## Diagnosing missing command acknowledgements
+
+GeGi command topics contain **UTF-8 JSON text**, not a nested \`TextValue\`
+wrapper. Both \`{"command":"stop_recording","request_id":"abc"}\` and
+\`{"dataType":"Command","command":"stop_recording","request_id":"abc"}\`
+are accepted. \`dataType: "Command"\` is an optional Prism typed-JSON
+discriminator; the dispatcher reads the top-level \`command\` field.
+
+For real detector actions, prefer the acknowledged \`gegi\` / \`gegi-start\`
+wrapper over one-shot \`prism pub\`. The wrapper displays a unique request ID,
+subscribes for a matching \`CommandResult\`, waits for a response, and checks
+acquisition progress on start commands. It **never automatically retries**:
+a timeout means the outcome is unknown, not that the detector did nothing.
+
+**Each Docker Compose deployment starts its own NATS broker by default.**
+Messages do not automatically travel between the brokers on two PCs.
+The publisher and recorder must use the *same* broker. When running
+\`docker compose exec app prism ... --ip nats\`, \`nats\` means that
+particular Compose project's NATS container, not a global GeGi service.
+
+Check the receiving pipeline and logs:
+
+\`\`\`bash
+docker compose ps
+docker compose logs --since=10m app
+# Read-only: observe recorder responses.
+docker compose exec app prism echo --protocol nats --ip nats --port 4222 --topic gegi.data_recorder.command_result
+# Read-only: observe forwarded detector responses.
+docker compose exec app prism echo --protocol nats --ip nats --port 4222 --topic gegi.detector.command_result
+\`\`\`
+
+A running \`app\` container does **not** establish that ImagerPro's
+\`172.31.1.40:27015\` TCP connection is healthy. Repeated \`Broken pipe\`
+errors mean the socket connection was lost, even if all Prism nodes still
+run. Check that ImagerPro is actually running and listening. The current
+TCP driver does **not** automatically reconnect a broken session: after
+ImagerPro is ready, restart the \`app\` service through the approved
+commissioning workflow to establish a new connection. Do not blindly
+repeat a scan command after an unknown outcome.
+
+For hardware-free transport regression testing, the optional scripts
+\`test/test_nats_one_shot_delivery.py\` and
+\`test/test_real_nats_command_roundtrip.py\` use a separate NATS instance
+on \`127.0.0.1:14222\` and synthetic \`gegi.diagnostics.*\` subjects.
+They never send detector commands.
+
 ## Recorder output
 
 For each timed recording, `data_recorder_node.py` writes timestamp-prefixed assets under `--output-dir`, including:

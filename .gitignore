@@ -321,3 +321,6 @@ data/
 
 # Word lock/temp files
 ~$*
+
+# Isolated local Python unit-test environment
+.venv-tests/

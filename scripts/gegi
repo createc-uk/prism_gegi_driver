@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""GeGi command shortcuts (managed by install_gegi.py)."""
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import uuid
+
+DEFAULT_REPO = str(Path(__file__).resolve().parents[1])
+DEFAULT_MODE = 'docker'
+COMMANDS = {
+    'start': ('data_recorder', 'start_timed_recording', 'Start scan + recording (minutes; default 5)'),
+    'stop': ('data_recorder', 'stop_recording', 'Stop scan + save recording'),
+    'clear-all': ('data_recorder', 'clear_all', 'Clear detector and all processing buffers'),
+    'detector-start': ('detector', 'start_acquisition', 'Start untimed acquisition, without recording'),
+    'detector-stop': ('detector', 'stop_acquisition', 'Stop detector acquisition only'),
+    'detector-timed': ('detector', 'start_timed_acquisition', 'Start timed acquisition only (minutes; default 5)'),
+    'detector-clear': ('detector', 'clear_data', 'Clear detector data'),
+    'detector-clear-windows': ('detector', 'clear_data_and_windows', 'Clear detector data and energy windows'),
+    'detector-toggle-bias': ('detector', 'toggle_bias_mode', 'Toggle detector bias'),
+    'spectrum-clear': ('spectrum', 'clear', 'Clear main spectrum'),
+    'singles-clear': ('spectrum_singles', 'clear', 'Clear singles spectrum'),
+    'activity-clear': ('activity', 'clear', 'Clear activity accumulation'),
+    'activity-flush': ('activity', 'flush', 'Publish and reset partial activity window'),
+    'heatmap-clear': ('spherical_heatmap', 'clear', 'Clear heatmap'),
+    'heatmap-save': ('spherical_heatmap', 'save_csv', 'Save heatmap CSV'),
+}
+WATCHES = {
+    'activity': 'gegi.activity.results',
+    'spectrum': 'gegi.spectrum.histogram',
+    'singles': 'gegi.spectrum_singles.histogram',
+    'run-info': 'gegi.detector.run_info',
+    'detector-info': 'gegi.detector.detector_info',
+    'dead-time': 'gegi.detector.dead_time_percent',
+    'results': 'gegi.*.command_result',
+}
+ALIASES = ['p'] + ['gegi-' + name for name in [*COMMANDS, *WATCHES, 'logs']]
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Commands (also available as gegi-COMMAND):\n' + '\n'.join(
+            '  %-24s %s' % (k, v[2]) for k, v in COMMANDS.items()) +
+        '\nWatch: ' + ', '.join(WATCHES) + '\nLogs: gegi logs (last 10 minutes)\nRaw Prism CLI: gegi prism ARGS (or p ARGS)')
+    parser.add_argument('--mode', choices=['docker', 'native'], default=os.getenv('GEGI_MODE', DEFAULT_MODE))
+    parser.add_argument('--timeout', type=float, default=60, help='Reply timeout in seconds (default 60)')
+    parser.add_argument('--dry-run', action='store_true', help='Show command without sending')
+    parser.add_argument('command', choices=[*COMMANDS, *WATCHES, 'prism', 'logs'])
+    parser.add_argument('args', nargs=argparse.REMAINDER)
+    return parser.parse_args(argv)
+
+
+class AcquisitionProgress:
+    """Observe incoming event data or a clock that actually advances."""
+    def __init__(self):
+        self.ready = threading.Event()
+        self.previous = None
+        self.lock = threading.Lock()
+
+    def receive(self, message, source=None):
+        try:
+            value = json.loads(message)
+            if value.get('dataType') == 'DoubleValue':
+                energy = float(value['value'])
+                if math.isfinite(energy) and energy > 0:
+                    self.ready.set()
+            elif value.get('valid') is True:
+                real = float(value['real_time_sec'])
+                if not math.isfinite(real) or real < 0:
+                    return
+                with self.lock:
+                    if self.previous is not None and real > self.previous:
+                        self.ready.set()
+                    self.previous = real
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
+
+
+def request(topic, payload, timeout):
+    # Import only in native command mode: host Docker wrappers need no bindings.
+    binding_dir = Path(os.getenv('GEGI_BINDINGS', '/opt/prism-python'))
+    if binding_dir.is_dir():
+        sys.path.insert(0, str(binding_dir))
+    import prism
+    app = prism.Application('gegi_cli', 'Acknowledged GeGi command', ['gegi_cli', '--protocol',
+        os.getenv('PRISM_PROTOCOL', 'nats'), '--server', os.getenv('PRISM_SERVER', 'localhost'),
+        '--port', os.getenv('PRISM_PORT', '4222')])
+    options = app.parse()
+    if options is None:
+        raise RuntimeError('Cannot parse Prism connection settings')
+    conn = app.create_connection(options)
+    if conn is None:
+        raise RuntimeError('Cannot connect to Prism server')
+    event = threading.Event()
+    replies = []
+    payload['request_id'] = uuid.uuid4().hex
+    cfg = prism.TextReceiverConfig()
+    cfg.source = topic + '_result'
+    receiver = app.create_text_receiver(options, conn, cfg)
+    def receive(message, source=None):
+        try:
+            result = json.loads(message)
+            if result.get('request_id') == payload['request_id']:
+                replies.append(result)
+                event.set()
+        except (ValueError, TypeError):
+            pass
+    receiver.on_receive(receive)
+    receiver.start()
+    progress = None
+    monitors = []
+    if payload.get('command') in ('start_timed_recording', 'start_timed_acquisition', 'start_acquisition'):
+        progress = AcquisitionProgress()
+        for source in ('gegi.driver.energy_deposit', 'gegi.detector.run_info'):
+            monitor_cfg = prism.TextReceiverConfig()
+            monitor_cfg.source = source
+            monitor = app.create_text_receiver(options, conn, monitor_cfg)
+            monitor.on_receive(progress.receive)
+            monitor.start()
+            monitors.append(monitor)
+    sender_cfg = prism.TextSenderConfig()
+    sender_cfg.destination = topic
+    sender = app.create_text_sender(options, conn, sender_cfg)
+    try:
+        if sender.send(json.dumps(payload)) is False:
+            raise RuntimeError('Prism could not send command')
+        if not event.wait(timeout):
+            raise RuntimeError('No acknowledgement on %s_result after %gs. Outcome unknown; check logs before retrying.' % (topic, timeout))
+        reply = replies[0]
+        if progress is not None and reply.get('success'):
+            print('Command accepted. Waiting for detector data or advancing acquisition time...', flush=True)
+            if not progress.ready.wait(timeout):
+                raise RuntimeError('Command accepted, but acquisition was NOT verified: no energy events or advancing run time. '
+                                   'Recorder may still be active. Run `gegi logs` to inspect the driver; do not blindly retry.')
+            print('Detector acquisition progress observed.', flush=True)
+        print(('OK: ' if reply.get('success') else 'FAILED: ') + reply.get('message', str(reply)), flush=True)
+        return 0 if reply.get('success') else 1
+    finally:
+        for monitor in monitors:
+            monitor.stop()
+            monitor.on_receive(lambda *_: None)
+        receiver.stop()
+        receiver.on_receive(lambda *_: None)
+        conn.close()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    name = Path(sys.argv[0]).name
+    if name.startswith('gegi-') and any(x in ('-h', '--help') for x in argv):
+        argv = ['--help']
+    elif name == 'p':
+        argv.insert(0, 'prism')
+    elif name.startswith('gegi-'):
+        argv.insert(0, name[5:])
+    opt = parse(argv)
+    topic = payload = None
+    if opt.command in COMMANDS:
+        ns, cmd, _ = COMMANDS[opt.command]
+        payload = {'command': cmd}
+        if opt.command in ('start', 'detector-timed'):
+            if len(opt.args) > 1 or (opt.args and opt.args[0] not in ('5', '10', '15', '20', '25', '30', '45', '60')):
+                raise ValueError('Supported minutes: 5, 10, 15, 20, 25, 30, 45, 60')
+            payload['duration_minutes'] = int(opt.args[0]) if opt.args else 5
+        elif opt.args:
+            raise ValueError('This command takes no arguments')
+        topic = 'gegi.' + ns + '.command'
+    if opt.mode == 'docker':
+        repo = Path(os.getenv('GEGI_REPO', DEFAULT_REPO))
+        if not (repo / 'docker-compose.yml').is_file():
+            raise ValueError('Set GEGI_REPO to the repository directory')
+        base = shlex.split(os.getenv('GEGI_DOCKER', 'sudo docker')) + ['compose', '-f', str(repo / 'docker-compose.yml')]
+        if opt.command == 'logs':
+            cmd = base + ['logs', '--since', '10m', '--tail', '200', 'app', *opt.args]
+            if opt.dry_run:
+                print(shlex.join(cmd))
+                return 0
+            return subprocess.call(cmd)
+        cmd = base + [
+            'exec', '-T', 'app', 'python3', '-', '--mode', 'native', '--timeout', str(opt.timeout), opt.command, *opt.args]
+    elif opt.command == 'logs':
+        raise ValueError('Run `gegi logs` on the Docker host')
+    elif topic:
+        if opt.dry_run:
+            print(topic + ' ' + json.dumps(payload))
+            return 0
+        return request(topic, payload, opt.timeout)
+    else:
+        prism = os.getenv('GEGI_PRISM') or shutil.which('prism') or str(Path(DEFAULT_REPO) / 'build/bin/prism')
+        args = opt.args if opt.command == 'prism' else ['echo', '--topic', WATCHES[opt.command], *opt.args]
+        cmd = [prism, *args, '--protocol', os.getenv('PRISM_PROTOCOL', 'nats'), '--ip',
+               os.getenv('PRISM_SERVER', 'localhost'), '--port', os.getenv('PRISM_PORT', '4222')]
+    if opt.dry_run:
+        print(shlex.join(cmd))
+        return 0
+    if opt.mode == 'docker':
+        # Send this CLI over stdin so host installs also work with older images.
+        return subprocess.run(cmd, input=Path(__file__).read_text(), text=True).returncode
+    return subprocess.call(cmd)
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, RuntimeError, ImportError, OSError) as error:
+        print('gegi: ' + str(error), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

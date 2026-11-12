@@ -61,7 +61,7 @@ python3 -m pip install numpy PyYAML scipy matplotlib
 python3 -c "import prism; print(prism.__file__)"
 ```
 
-This separate install is required because the driver CMake project forces `PSM_BUILD_PYTHON_BINDINGS=OFF`. The Python nodes, live plotting tools, and node-importing tests all require `import prism` to succeed in the selected Python environment.
+This separate install is required because the driver CMake project forces `PSM_BUILD_PYTHON_BINDINGS=OFF`. The Python nodes and live plotting tools require `import prism` to succeed in the selected Python environment. Offline unit tests can run without the native bindings (see Testing below).
 
 ## Run NATS
 
@@ -237,8 +237,117 @@ python3 tools/plot_live_2d_heatmap.py --protocol nats --server localhost --port 
 bash test/run_tests.sh
 ```
 
-The tests do not require detector hardware or NATS, but the selected Python 3 environment must have the Prism bindings and the processing dependencies importable.
+The runner automatically creates `.venv-tests` and installs NumPy, SciPy and
+PyYAML there on first use. It works without system pip, ensurepip, sudo or Docker;
+the first run needs internet access. Run `python3 test/setup_env.py` to refresh the
+environment. System Python is left unchanged.
+
+The unit tests do not require detector hardware or NATS. Without native Prism
+bindings the runner supplies an import-only placeholder: any attempted use of the
+Prism API fails loudly. This verifies processing logic and mocked command handling,
+not live transport. To require real Prism bindings, select an environment where
+they are installed:
+
+```bash
+PYTHON=/path/to/venv/bin/python bash test/run_tests.sh --require-prism -v
+```
+
+The C++ live-NATS integration test is separate from this Python unit-test runner.
 
 ## License
 
 See [LICENSE.md](LICENSE.md).
+
+## GeGi command shortcuts
+
+Install the CLI and all `gegi-*` shortcuts on the host (Python 3 required):
+
+```bash
+python3 scripts/install_gegi.py
+source ~/.bashrc
+gegi-start 5
+gegi-stop
+```
+
+The host installation uses `sudo docker compose exec` against this repository's
+`app` service, from any working directory. It sends its CLI code into the running
+container, so an existing image with the Prism Python bindings also works without
+a rebuild. It does not start/restart services automatically. Start the pipeline
+separately with `sudo env DETECTOR_IP=172.31.1.40 docker compose up -d` (substitute
+your detector address). That environment override applies to that invocation only;
+set `DETECTOR_IP` in the repo's `.env` to retain it across Compose invocations.
+
+New Docker builds install the same shortcuts in `/usr/local/bin`, using native
+Prism connections. For example: `sudo docker compose exec app gegi-start 5`.
+For a local build instead of Docker, install with
+`python3 scripts/install_gegi.py --mode native`; install the Prism Python bindings
+into your Python environment first. Set `GEGI_PRISM` to your built Prism CLI if it
+is not on PATH (default fallback: `build/bin/prism` in this repo).
+
+Every command below is available as `gegi COMMAND` or `gegi-COMMAND`:
+
+| Command | Action |
+|---|---|
+| `start [minutes]` | Timed scan **and recording**; default 5 minutes |
+| `stop` | Stop scan early and save recording |
+| `clear-all` | Clear detector data/windows and downstream accumulators |
+| `detector-start` | Untimed detector acquisition only; no recording |
+| `detector-timed [minutes]` | Timed detector acquisition only; no recording |
+| `detector-stop` | Stop detector only; use `stop` to also finish recording |
+| `detector-clear` | Clear detector data |
+| `detector-clear-windows` | Clear detector data and energy windows |
+| `detector-toggle-bias` | Toggle hardware bias |
+| `spectrum-clear`, `singles-clear` | Clear the respective spectrum |
+| `activity-clear` | Clear activity accumulation |
+| `activity-flush` | Publish and reset partial activity window |
+| `heatmap-clear` | Clear heatmap |
+| `heatmap-save` | Save heatmap CSV to its configured output directory |
+| `activity`, `spectrum`, `singles` | Watch live topic messages (terminal text) |
+| `run-info`, `detector-info`, `dead-time` | Watch detector state |
+| `results` | Watch all command-result topics |
+| `logs` | Show the app container logs from the last ten minutes (host Docker mode) |
+
+Supported timed durations: 5, 10, 15, 20, 25, 30, 45, 60 minutes.
+Activity defaults to a 300-second window; the activity watcher may stay quiet
+until the window completes or recording stops. Ctrl+C ends a watcher only.
+Clearing buffers and toggling bias take effect immediately when explicitly invoked.
+
+Control commands subscribe for replies **before** sending and correlate by a
+unique request ID. They print `OK`, `FAILED`, or time out with an unknown outcome;
+there are no automatic retries. A detector success reply confirms the TCP send. Start commands additionally wait
+for energy events or advancing valid run-info before reporting success. If progress
+is not observed, they fail with an unverified acquisition message; recording may
+still be active, so inspect `gegi logs` before retrying. `--timeout` applies separately
+to the command reply and the acquisition-progress wait.
+Raw `p pub` / `gegi prism pub` still only reports publication, not command success.
+
+```bash
+gegi --help
+gegi --dry-run start 5          # inspect without sending
+gegi --timeout 120 stop        # allow longer for final output saving
+p echo --topic gegi.detector.run_info
+```
+
+Connection settings: `PRISM_PROTOCOL`, `PRISM_SERVER`, `PRISM_PORT`. Docker mode
+uses the container's settings. Host overrides: `GEGI_REPO` (Compose directory),
+`GEGI_DOCKER=docker` (omit sudo if your account has Docker access),
+`GEGI_MODE=native` or `docker`. Native mode can use `GEGI_BINDINGS` for a custom
+Prism Python install directory. Re-run the installer after CLI changes to update
+an existing host installation. Existing unrelated commands are never overwritten.
+
+Uninstall the host commands and their managed Bash PATH entry:
+
+```bash
+python3 scripts/install_gegi.py --uninstall
+```
+
+Use the same `--prefix` and `--shell-rc` if customized at installation.
+Installation defaults to `~/.local/bin`; `--prefix /usr/local --no-shell` is useful
+inside images. To remove image shortcuts from a running container:
+
+```bash
+sudo docker compose exec app python3 scripts/install_gegi.py \
+  --prefix /usr/local --no-shell --uninstall
+```
+
+That container-only removal lasts until it is recreated from the image.
